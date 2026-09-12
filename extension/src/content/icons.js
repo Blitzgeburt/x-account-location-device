@@ -5,7 +5,7 @@
  * Web / Unknown) plus the hovercard glyphs.
  */
 
-import { COUNTRY_FLAGS } from '../shared/constants.js';
+import { COUNTRY_FLAGS, canonicalCountry } from '../shared/constants.js';
 import { classifyDevice } from '../shared/utils.js';
 
 const NS = 'http://www.w3.org/2000/svg';
@@ -317,7 +317,7 @@ export function glyph(name, size = 16) {
  */
 export function flagImage(countryName) {
     if (!countryName) return null;
-    const emoji = COUNTRY_FLAGS[String(countryName).trim().toLowerCase()];
+    const emoji = COUNTRY_FLAGS[canonicalCountry(countryName)];
     if (!emoji || emoji === '🌍') return null;
     const cp = Array.from(emoji).map(c => c.codePointAt(0).toString(16)).join('-');
     const img = document.createElement('img');

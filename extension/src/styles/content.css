@@ -169,6 +169,23 @@
     pointer-events: auto;
 }
 
+.x-posed-card-actions {
+    position: relative;
+    z-index: 1;
+    padding: 10px 14px 13px;
+    border-top: 1px solid var(--xp-border);
+}
+.x-posed-card-actions .x-posed-allowlist-button {
+    width: 100%;
+    padding: 8px 10px;
+    font-size: 12px;
+    overflow-wrap: anywhere;
+}
+.x-posed-allowlist-button:disabled { cursor: wait; opacity: .6; }
+.x-posed-allowlist-button:focus-visible { outline: 2px solid var(--xp-accent); outline-offset: 2px; }
+.x-posed-allowlist-status { margin-top: 7px; font-size: 12px; line-height: 1.4; color: var(--xp-text-dim); }
+.x-posed-allowlist-status.x-posed-allowlist-error { color: var(--xp-danger); }
+
 /* Touch / no-hover (e.g. Firefox for Android): the dossier opens on tap and renders
    as a bottom sheet filling the width, overriding the desktop anchor positioning
    (the inline top/left set in JS lack !important, so these win). */
@@ -612,6 +629,28 @@ article[data-testid="tweet"] div[role="link"][tabindex="0"]:has([data-x-quote-bl
     font-weight: 700;
     letter-spacing: 0.01em;
     color: var(--xp-alert);
+}
+/* Name the filter that collapsed the card (issue #42), so the reader knows which list
+   to go look at without revealing the post first. Overrides the generic label above;
+   an unrecognised or missing reason simply keeps it. Category only, never the matched
+   value — a blocked tag is arbitrary user text and would break this fixed-height row. */
+article[data-testid="tweet"] div[role="link"][tabindex="0"]:has([data-x-quote-block="hide"][data-x-quote-reason="country"])::before {
+    content: "Quoted post hidden · Country";
+}
+article[data-testid="tweet"] div[role="link"][tabindex="0"]:has([data-x-quote-block="hide"][data-x-quote-reason="region"])::before {
+    content: "Quoted post hidden · Region";
+}
+article[data-testid="tweet"] div[role="link"][tabindex="0"]:has([data-x-quote-block="hide"][data-x-quote-reason="tag"])::before {
+    content: "Quoted post hidden · Name tag";
+}
+article[data-testid="tweet"] div[role="link"][tabindex="0"]:has([data-x-quote-block="hide"][data-x-quote-reason="bio"])::before {
+    content: "Quoted post hidden · Bio tag";
+}
+article[data-testid="tweet"] div[role="link"][tabindex="0"]:has([data-x-quote-block="hide"][data-x-quote-reason="label"])::before {
+    content: "Quoted post hidden · Account type";
+}
+article[data-testid="tweet"] div[role="link"][tabindex="0"]:has([data-x-quote-block="hide"][data-x-quote-reason="affiliation"])::before {
+    content: "Quoted post hidden · Affiliation";
 }
 article[data-testid="tweet"] div[role="link"][tabindex="0"]:has([data-x-quote-block="hide"])::after {
     content: "click to show";

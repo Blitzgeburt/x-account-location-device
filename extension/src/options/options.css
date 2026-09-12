@@ -1450,6 +1450,10 @@ body {
     margin: 0;
 }
 
+.whats-new-cta p + p {
+    margin-top: 10px;
+}
+
 .whats-new-cta strong {
     color: var(--xp-accent);
 }

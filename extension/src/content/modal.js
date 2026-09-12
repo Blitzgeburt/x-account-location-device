@@ -4,7 +4,7 @@
  * Uses tabbed interface for switching between countries and regions
  */
 
-import { COUNTRY_LIST, REGION_LIST, LANGUAGE_LIST, PCF_LABELS, CSS_CLASSES, TIMING } from '../shared/constants.js';
+import { COUNTRY_LIST, REGION_LIST, LANGUAGE_LIST, ACCOUNT_LABELS, CSS_CLASSES, TIMING } from '../shared/constants.js';
 import { formatCountryName, createElement, debounce, describeTagRisk } from '../shared/utils.js';
 import { glyph, flagImage } from './icons.js';
 
@@ -439,7 +439,7 @@ function createRegionBody(blockedRegions, onAction) {
 
     const info = createElement('div', {
         className: 'x-blocker-info',
-        textContent: 'Block entire regions. Some users show regional locations like "South Asia" or "Europe" instead of specific countries.'
+        textContent: 'Match the exact regional label X reports, such as "South Asia" or "Europe". Selecting "Africa" does not also select countries such as Kenya; choose those in Countries.'
     });
 
     const search = createElement('input', {
@@ -799,7 +799,7 @@ function createTagSection({ title, hint, placeholder, getSet, onAction }) {
  * part of the account and therefore given its own section.
  *   - Display name  - substring of the name shown next to the handle
  *   - Bio           - substring of the profile description
- *   - Account label - X's own structured Parody / Commentary / Fan value
+ *   - Account label - X's Parody / Commentary / Fan value or rendered grey badge
  */
 function createTagBody(onTagAction, onBioTagAction, onPcfAction) {
     const body = createElement('div', { className: 'x-blocker-body x-blocker-tab-panel', 'data-panel': 'tags' });
@@ -834,20 +834,27 @@ function createTagBody(onTagAction, onBioTagAction, onPcfAction) {
     }));
     labelHeading.appendChild(createElement('span', {
         className: 'x-blocker-tag-group-hint',
-        textContent: 'X’s own label — works even when the name doesn’t say so'
+        textContent: 'X’s own label or grey checkmark — not inferred from names or bios'
     }));
     const labelPills = createElement('div', { className: 'x-blocker-common-tags' });
     labelSection.appendChild(labelHeading);
     labelSection.appendChild(labelPills);
+    labelSection.appendChild(createElement('div', {
+        className: 'x-blocker-tag-group-hint',
+        textContent: 'Government / multilateral matches X’s rendered grey checkmark, even with profile enrichment off. Unknown or unbadged accounts are not inferred.'
+    }));
 
     const renderLabels = () => {
         labelPills.replaceChildren();
         const fragment = document.createDocumentFragment();
-        for (const label of PCF_LABELS) {
+        for (const label of ACCOUNT_LABELS) {
             const isBlocked = localBlockedPcf.has(label.value);
             const pill = createElement('span', {
                 className: `x-blocker-common-tag${isBlocked ? ' blocked' : ''}`,
                 textContent: label.name,
+                role: 'button',
+                tabindex: '0',
+                'aria-pressed': isBlocked ? 'true' : 'false',
                 title: isBlocked ? 'Click to unblock' : 'Click to block'
             });
             pill.addEventListener('click', async () => {
@@ -858,6 +865,12 @@ function createTagBody(onTagAction, onBioTagAction, onPcfAction) {
                     for (const v of response.data) localBlockedPcf.add(v);
                     renderLabels();
                     updateStats(tagTotal(), 'tags');
+                }
+            });
+            pill.addEventListener('keydown', event => {
+                if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault();
+                    pill.click();
                 }
             });
             fragment.appendChild(pill);
@@ -1142,4 +1155,3 @@ function updateStats(count, type = 'countries') {
         stats.textContent = `${count} ${label} blocked`;
     }
 }
-

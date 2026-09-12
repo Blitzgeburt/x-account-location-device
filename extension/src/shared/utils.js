@@ -4,7 +4,7 @@
  * @module utils
  */
 
-import { COUNTRY_FLAGS } from './constants.js';
+import { COUNTRY_FLAGS, REGION_FLAGS, SELECTORS, canonicalCountry } from './constants.js';
 
 /**
  * Debounce function - delays execution until after wait milliseconds have elapsed
@@ -86,13 +86,14 @@ function isWindowsPlatform() {
  * @returns {string|null} - Flag emoji, HTML img tag, or null
  */
 export function getFlagEmoji(countryName) {
-    if (!countryName) return null;
+    if (!countryName || typeof countryName !== 'string') return null;
     
-    const normalized = countryName.trim().toLowerCase();
-    const emoji = COUNTRY_FLAGS[normalized] || '🌍';
+    const normalized = canonicalCountry(countryName);
+    const countryFlag = Object.hasOwn(COUNTRY_FLAGS, normalized) ? COUNTRY_FLAGS[normalized] : null;
+    const emoji = countryFlag || (Object.hasOwn(REGION_FLAGS, normalized) ? REGION_FLAGS[normalized] : '🌍');
     
     // Check if we are on Windows (which doesn't support flag emojis well)
-    if (isWindowsPlatform() && emoji !== '🌍') {
+    if (countryFlag && isWindowsPlatform()) {
         // Convert emoji to Twemoji URL
         const codePoints = Array.from(emoji)
             .map(c => c.codePointAt(0).toString(16))
@@ -127,6 +128,7 @@ const COUNTRY_CODES = {
     'pakistan': 'PK', 'bangladesh': 'BD', 'sri lanka': 'LK',
     'portugal': 'PT', 'greece': 'GR', 'ireland': 'IE', 'austria': 'AT',
     'czech republic': 'CZ', 'czechia': 'CZ', 'romania': 'RO', 'hungary': 'HU',
+    'ivory coast': 'CI', 'laos': 'LA', 'syria': 'SY', 'bonaire': 'BQ',
     'africa': 'AF', 'europe': 'EU', 'asia': 'AS'
 };
 
@@ -137,9 +139,9 @@ const COUNTRY_CODES = {
  * @returns {string} - 2-letter country code or first 2 chars of location
  */
 export function getCountryCode(location) {
-    if (!location) return '';
-    const key = location.trim().toLowerCase();
-    return COUNTRY_CODES[key] || location.substring(0, 2).toUpperCase();
+    if (!location || typeof location !== 'string') return '';
+    const key = canonicalCountry(location);
+    return Object.hasOwn(COUNTRY_CODES, key) ? COUNTRY_CODES[key] : location.substring(0, 2).toUpperCase();
 }
 
 /**
@@ -185,8 +187,8 @@ export function getDeviceCountry(deviceString) {
     const words = deviceString.trim().toLowerCase().split(/\s+/);
     let result = null;
     for (let i = words.length; i > 0; i--) {
-        const candidate = words.slice(0, i).join(' ');
-        if (COUNTRY_FLAGS[candidate]) { result = candidate; break; }
+        const candidate = canonicalCountry(words.slice(0, i).join(' '));
+        if (Object.hasOwn(COUNTRY_FLAGS, candidate)) { result = candidate; break; }
     }
 
     _deviceCountryCache.set(deviceString, result);
@@ -269,7 +271,10 @@ export function extractUsername(element) {
     }
 
     if (candidates.length > 0) {
-        const profileHandle = currentProfileHandle();
+        // Linkless quoted headers also reach this path. The page URL identifies
+        // the enclosing post/profile, not its quoted author, so never prefer it
+        // over the quote's own handle (even if its display name matches that URL).
+        const profileHandle = element.closest(SELECTORS.TWEET) ? null : currentProfileHandle();
         if (profileHandle) {
             const onProfile = candidates.find(
                 c => c.toLowerCase() === profileHandle.toLowerCase()

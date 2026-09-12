@@ -7,6 +7,8 @@
  * content script via CustomEvents.
  */
 
+import { PacedLookupQueue, readRateLimitReset } from '../shared/request-policy.js';
+
 (function() {
     'use strict';
 
@@ -32,6 +34,8 @@
     const EVENT_SET_ENRICHMENT = 'x-posed-set-enrichment';
     const API_PATTERN = /x\.com\/i\/api\/graphql/;
     const ABOUT_QUERY_ID = 'XRqGa7EeokUU5kppkh13EA';
+    const lookupQueue = new PacedLookupQueue();
+    const pendingLookups = new Map();
 
     // Kept local rather than imported from shared/constants.js: this bundle is injected into
     // the page, and pulling that module in would drag the country tables along with it.
@@ -184,48 +188,54 @@
 
         try {
             if (!id || !screenName || !capturedHeaders) {
-                throw new Error('No captured page headers available');
+                throw Object.assign(new Error('No captured page headers available'), { code: 'NO_HEADERS' });
             }
 
-            const variables = encodeURIComponent(JSON.stringify({ screenName }));
-            const url = `/i/api/graphql/${ABOUT_QUERY_ID}/AboutAccountQuery?variables=${variables}`;
-            const response = await fetch(url, {
-                headers: {
-                    ...capturedHeaders,
-                    'accept-language': 'en-US,en;q=0.9'
-                },
-                method: 'GET',
-                credentials: 'include'
-            });
-
-            if (!response.ok) {
-                if (response.status === 401 || response.status === 403) {
-                    headersCaptured = false;
-                    capturedHeaders = null;
-                    window.dispatchEvent(new CustomEvent(EVENT_FETCH_USER_INFO_RESULT, {
-                        detail: JSON.stringify({
-                            id,
-                            success: false,
-                            error: 'Authentication failed',
-                            code: 'UNAUTHORIZED'
-                        })
-                    }));
-                    return;
-                }
-
-                throw new Error(`Page API error: ${response.status}`);
+            const key = screenName.toLowerCase();
+            if (!pendingLookups.has(key)) {
+                const pending = lookupQueue.add(async signal => {
+                    if (!capturedHeaders) {
+                        throw Object.assign(new Error('No captured page headers available'), { code: 'NO_HEADERS' });
+                    }
+                    const variables = encodeURIComponent(JSON.stringify({ screenName }));
+                    const url = `/i/api/graphql/${ABOUT_QUERY_ID}/AboutAccountQuery?variables=${variables}`;
+                    const response = await fetch(url, {
+                        headers: { ...capturedHeaders, 'accept-language': 'en-US,en;q=0.9' },
+                        method: 'GET', credentials: 'include', signal
+                    });
+                    if (response.status === 429) {
+                        lookupQueue.setRateLimit(readRateLimitReset(response.headers));
+                        throw lookupQueue.rateLimitError();
+                    }
+                    if (response.status === 401 || response.status === 403) {
+                        headersCaptured = false;
+                        capturedHeaders = null;
+                        throw Object.assign(new Error('Authentication failed'), { code: 'UNAUTHORIZED' });
+                    }
+                    if (!response.ok) {
+                        throw Object.assign(new Error(`Page API error: ${response.status}`), {
+                            code: response.status === 404 ? 'NOT_FOUND' : 'NETWORK_ERROR'
+                        });
+                    }
+                    return parseAboutAccount(await response.json(), screenName);
+                }).finally(() => { pendingLookups.delete(key); });
+                pendingLookups.set(key, pending);
             }
+            const data = await pendingLookups.get(key);
 
             window.dispatchEvent(new CustomEvent(EVENT_FETCH_USER_INFO_RESULT, {
                 detail: JSON.stringify({
                     id,
                     success: true,
-                    data: parseAboutAccount(await response.json(), screenName)
+                    data
                 })
             }));
         } catch (error) {
             window.dispatchEvent(new CustomEvent(EVENT_FETCH_USER_INFO_RESULT, {
-                detail: JSON.stringify({ id, success: false, error: error?.message || String(error) })
+                detail: JSON.stringify({
+                    id, success: false, error: error?.message || String(error),
+                    code: error?.code || 'NETWORK_ERROR', retryAfter: error?.retryAfter || null
+                })
             }));
         }
     });

@@ -33,10 +33,19 @@ class UserCacheStorage {
                 // Load non-expired entries with their original expiry times,
                 // keeping the persisted `{ value, expiry }` shape in memory.
                 for (const [key, data] of Object.entries(stored)) {
-                    if (data && data.expiry > now && data.value) {
-                        this.cache.set(key, { value: UserCacheStorage.fromPersistedValue(data.value), expiry: data.expiry });
+                    if (!data || !Number.isFinite(data.expiry) || !data.value) continue;
+
+                    const value = UserCacheStorage.fromPersistedValue(data.value);
+                    // Older saves dropped the source timestamp. Keep that age explicitly
+                    // unknown and retain the old deadline rather than inventing freshness.
+                    const timestamp = UserCacheStorage.observationTimestamp(value, now);
+                    const expiry = timestamp === null
+                        ? data.expiry
+                        : Math.min(data.expiry, timestamp + CACHE_CONFIG.EXPIRY_MS);
+                    if (expiry > now) {
+                        this.cache.set(key, { value: { ...value, timestamp }, expiry });
                         loadedCount++;
-                    } else if (data && data.expiry <= now) {
+                    } else {
                         expiredCount++;
                     }
                 }
@@ -59,8 +68,8 @@ class UserCacheStorage {
      * (no `unlimitedStorage` permission), so past about 12.6k accounts every write threw
      * and the cache silently stopped persisting while re-serialising tens of MB a minute.
      *
-     * Only four things survive a reload: the timeline reads location, device and accuracy,
-     * and the affiliation filter reads `meta.affiliate` / `meta.affiliateUsername`. The
+     * Keep location, device, accuracy, affiliation, and source freshness/provenance.
+     * The affiliation filter reads `meta.affiliate` / `meta.affiliateUsername`. The
      * display name, avatar, verification state and the rest stay in memory for this
      * session and are dropped on write — `partial` tells the hovercard to do a live fetch
      * rather than render a card with half its fields blank.
@@ -73,8 +82,10 @@ class UserCacheStorage {
         const slim = {
             location: value.location ?? null,
             device: value.device ?? null,
-            locationAccurate: value.locationAccurate !== false
+            locationAccurate: value.locationAccurate !== false,
+            timestamp: UserCacheStorage.observationTimestamp(value)
         };
+        if (typeof value.fromCloud === 'boolean') slim.fromCloud = value.fromCloud;
 
         // Affiliation is flattened to a single short key rather than a nested meta object,
         // which is worth ~55 bytes on every one of up to 50k entries:
@@ -130,6 +141,7 @@ class UserCacheStorage {
     }
 
     async save(force = false) {
+        this.pruneExpired();
         // Dirty-gated: skip the whole rebuild+write when nothing changed.
         if (!this.dirty && !force) return;
 
@@ -194,18 +206,58 @@ class UserCacheStorage {
 
     get(screenName) {
         const entry = this.cache.get(screenName);
-        return entry ? entry.value : undefined;
+        if (!entry) return undefined;
+        if (entry.expiry <= Date.now()) {
+            this.delete(screenName);
+            return undefined;
+        }
+        return entry.value;
     }
 
+    /** Source observation time in milliseconds; null means unknown or invalid. */
+    static observationTimestamp(data, now = Date.now()) {
+        const timestamp = data?.timestamp;
+        return Number.isFinite(timestamp) && timestamp > 0 && timestamp <= now
+            ? timestamp
+            : null;
+    }
+
+    static isFreshObservation(data, now = Date.now()) {
+        const timestamp = UserCacheStorage.observationTimestamp(data, now);
+        return timestamp !== null && timestamp + CACHE_CONFIG.EXPIRY_MS > now;
+    }
+
+    /**
+     * Store live data or a dated cached observation without renewing its source age.
+     * Undated live callers remain supported. Cached/imported data must carry a
+     * timestamp (null when unknown); an unknown legacy entry keeps its old expiry.
+     * @returns {boolean} whether the value was accepted
+     */
     set(screenName, data) {
-        // Set fresh expiry for new/updated entries; expiry lives in the envelope.
-        this.cache.set(screenName, { value: data, expiry: Date.now() + CACHE_CONFIG.EXPIRY_MS });
+        if (!data || typeof data !== 'object') return false;
+        const now = Date.now();
+        const isUndatedLive = !Object.hasOwn(data, 'timestamp') && data.fromCloud !== true;
+        const timestamp = isUndatedLive ? now : UserCacheStorage.observationTimestamp(data, now);
+        const previous = this.cache.get(screenName);
+        let expiry;
+        if (timestamp === null) {
+            // Re-selecting the same legacy local record after a cloud lookup must not
+            // renew it. A newly received cloud/import record of unknown age is a miss.
+            if (!previous || previous.value !== data || previous.expiry <= now) return false;
+            expiry = previous.expiry;
+        } else {
+            expiry = timestamp + CACHE_CONFIG.EXPIRY_MS;
+            if (previous?.value === data) expiry = Math.min(expiry, previous.expiry);
+            if (expiry <= now) return false;
+        }
+        this.cache.set(screenName, { value: { ...data, timestamp }, expiry });
         this.dirty = true;
         this.scheduleSave();
+        return true;
     }
 
     has(screenName) {
-        return this.cache.has(screenName);
+        return this.get(screenName) !== undefined;
     }
 
     delete(screenName) {
@@ -224,7 +276,15 @@ class UserCacheStorage {
     }
 
     get size() {
+        this.pruneExpired();
         return this.cache.size;
+    }
+
+    pruneExpired() {
+        const now = Date.now();
+        for (const [key, entry] of this.cache.entries()) {
+            if (entry.expiry <= now) this.delete(key);
+        }
     }
 
     /**
@@ -234,12 +294,14 @@ class UserCacheStorage {
      * @param {(screenName: string, value: object) => void} callback
      */
     forEach(callback) {
+        this.pruneExpired();
         for (const [key, entry] of this.cache.entries()) {
             callback(key, entry.value);
         }
     }
 
     getAll() {
+        this.pruneExpired();
         return Array.from(this.cache.entries()).map(([key, entry]) => ({
             screenName: key,
             ...entry.value
@@ -270,6 +332,7 @@ class BlockedSetStorage {
         this.label = label;
         this.normalize = normalize;
         this.defaults = Array.isArray(defaults) ? defaults : [];
+        this.mutationQueue = Promise.resolve();
     }
 
     async load() {
@@ -278,17 +341,15 @@ class BlockedSetStorage {
             const stored = result[this.storageKey];
 
             if (Array.isArray(stored)) {
-                this.values = new Set(stored);
+                // Aliases and normalizers can change between releases. Old saved
+                // values must obey the same rules as newly added values.
+                this.values = new Set(stored.map(value => this.normalize(value)).filter(Boolean));
                 console.log(`🚫 Loaded ${this.values.size} ${this.label}`);
             } else if (this.defaults.length) {
                 // First run only: the key has never been written. Seed the defaults
                 // and persist once so the value is real and consistent everywhere —
                 // after this the user's edits (including clearing) stick.
-                for (const value of this.defaults) {
-                    const normalized = this.normalize(value);
-                    if (normalized) this.values.add(normalized);
-                }
-                await this.save();
+                await this.setAll(this.defaults);
                 console.log(`🌱 Seeded ${this.values.size} default ${this.label}`);
             }
 
@@ -299,16 +360,31 @@ class BlockedSetStorage {
         }
     }
 
-    async save() {
+    async save(values = this.values) {
         try {
-            const array = Array.from(this.values);
+            const array = Array.from(values);
             await browserAPI.storage.local.set({
                 [this.storageKey]: array
             });
             console.log(`💾 Saved ${array.length} ${this.label}`);
         } catch (error) {
             console.error(`Failed to save ${this.label}:`, error);
+            throw error;
         }
+    }
+
+    /** Commit one mutation at a time; failed writes never change the visible Set. */
+    commitMutation(change) {
+        const operation = this.mutationQueue.then(async () => {
+            const next = new Set(this.values);
+            if (change(next) === false) return;
+            await this.save(next);
+            this.values = next;
+        });
+        // Keep later operations usable after a failure, while returning the real
+        // rejection to the caller so the message handler reports success:false.
+        this.mutationQueue = operation.catch(() => {});
+        return operation;
     }
 
     /**
@@ -327,8 +403,10 @@ class BlockedSetStorage {
                 }
             }
         }
-        this.values = next;
-        return this.save();
+        return this.commitMutation(values => {
+            values.clear();
+            for (const value of next) values.add(value);
+        });
     }
 
     isBlocked(value) {
@@ -340,31 +418,26 @@ class BlockedSetStorage {
 
     add(value) {
         const normalized = this.normalize(value);
-        if (normalized && !this.values.has(normalized)) {
-            this.values.add(normalized);
-            return this.save();
-        }
-        return Promise.resolve();
+        if (!normalized) return Promise.resolve();
+        return this.commitMutation(values => {
+            if (values.has(normalized)) return false;
+            values.add(normalized);
+        });
     }
 
     remove(value) {
         const normalized = this.normalize(value);
-        if (normalized && this.values.has(normalized)) {
-            this.values.delete(normalized);
-            return this.save();
-        }
-        return Promise.resolve();
+        if (!normalized) return Promise.resolve();
+        return this.commitMutation(values => values.delete(normalized));
     }
 
     toggle(value) {
         const normalized = this.normalize(value);
         if (!normalized) return Promise.resolve();
-        if (this.values.has(normalized)) {
-            this.values.delete(normalized);
-        } else {
-            this.values.add(normalized);
-        }
-        return this.save();
+        return this.commitMutation(values => {
+            if (values.has(normalized)) values.delete(normalized);
+            else values.add(normalized);
+        });
     }
 
     /**
@@ -383,8 +456,7 @@ class BlockedSetStorage {
     }
 
     clear() {
-        this.values.clear();
-        return this.save();
+        return this.commitMutation(values => { values.clear(); });
     }
 
     get size() {
@@ -582,7 +654,8 @@ export const blockedBioTags = new BlockedSetStorage({
     label: 'blocked bio tags',
     normalize: normalizeLower
 });
-// X's Parody/Commentary/Fan labels, stored as the lowercase enum value.
+// Account-label choices (PCF labels and the optional grey-checkmark filter). Keep
+// the existing storage key for backup and settings compatibility; none are seeded.
 export const blockedPcf = new BlockedSetStorage({
     storageKey: STORAGE_KEYS.BLOCKED_PCF,
     label: 'blocked account labels',

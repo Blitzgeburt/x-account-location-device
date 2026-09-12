@@ -11,6 +11,7 @@
 import { STORAGE_KEYS, CLOUD_CACHE_CONFIG, affiliationWasChecked } from '../shared/constants.js';
 import browserAPI from '../shared/browser-api.js';
 import { debounce } from '../shared/utils.js';
+import { UserCacheStorage } from '../shared/storage.js';
 
 // Twitter launched in 2006; anything earlier is bad data, not an old account.
 const MIN_CREATED_AT_SECONDS = 1136073600;
@@ -388,6 +389,13 @@ class CloudCacheClient {
                 if (data.results) {
                     const now = Date.now();
                     for (const [username, info] of Object.entries(data.results)) {
+                        // Retain the source cache timestamp across this download.
+                        // Invalid/expired dates cannot become new hits.
+                        const timestamp = Number.isFinite(info?.t) ? info.t * 1000 : null;
+                        if (!UserCacheStorage.isFreshObservation({ timestamp }, now)) {
+                            this.stats.misses++;
+                            continue;
+                        }
                         // Validate and sanitize cloud data
                         const sanitizedLocation = this.sanitizeInput(info.l);
                         const sanitizedDevice = this.sanitizeInput(info.d);
@@ -405,7 +413,7 @@ class CloudCacheClient {
                             device: sanitizedDevice,
                             locationAccurate: info.a !== false,
                             fromCloud: true,
-                            timestamp: info.t * 1000 // Convert seconds to ms
+                            timestamp
                         };
 
                         // Optional shared profile signals (Worker v2.8.0). Mapped into the
@@ -498,6 +506,9 @@ class CloudCacheClient {
         if (!this.enabled || !username || !data) {
             return;
         }
+        // Do not circulate old cloud data as a newly observed account, or upload
+        // legacy local records whose original observation time was lost.
+        if (data.fromCloud === true || !UserCacheStorage.isFreshObservation(data)) return;
 
         const normalizedUsername = username.toLowerCase();
 
@@ -727,8 +738,8 @@ class CloudCacheClient {
             const batchEntries = {};
             
             for (const [username, data] of batch) {
-                // Skip entries without valid location data
-                if (!data || !data.location) {
+                // Keep the same observation/provenance checks as normal contributions.
+                if (!data || !data.location || data.fromCloud === true || !UserCacheStorage.isFreshObservation(data)) {
                     skipped++;
                     continue;
                 }

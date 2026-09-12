@@ -295,9 +295,8 @@ async function _resolveUserInfo({ screenName, csrfToken }) {
     }
 
     // 1. Check local cache first
-    let localEntry = null;
-    if (userCache.has(screenName)) {
-        localEntry = userCache.get(screenName);
+    let localEntry = userCache.get(screenName) || null;
+    if (localEntry) {
         if (!wantsRicherRecord(localEntry)) {
             if (debug23) console.log(`[xposed#23] @${screenName} source=local loc=${localEntry?.location}`);
             return {
@@ -326,15 +325,16 @@ async function _resolveUserInfo({ screenName, csrfToken }) {
 
                 if (debug23) console.log(`[xposed#23] @${screenName} source=cloud loc=${cloudData?.location} ageMs=${Date.now() - (cloudData?.timestamp || 0)}`);
 
-                // Store in local cache for future use
-                userCache.set(screenName, best);
-
-                return {
-                    success: true,
-                    data: best,
-                    cached: true,
-                    source: best === cloudData ? 'cloud' : 'local'
-                };
+                // A source observation can expire while the lookup is in flight.
+                // Only serve it if the cache accepts its original deadline.
+                if (userCache.set(screenName, best)) {
+                    return {
+                        success: true,
+                        data: best,
+                        cached: true,
+                        source: best === cloudData ? 'cloud' : 'local'
+                    };
+                }
             }
         } catch (error) {
             console.warn('☁️ Cloud cache lookup failed:', error.message);
@@ -346,6 +346,7 @@ async function _resolveUserInfo({ screenName, csrfToken }) {
     // richer one. It didn't, so serve what we have. Spending an X API call purely to
     // learn an affiliation is what would re-resolve an entire timeline and burn the
     // rate limit — the hovercard is the path that enriches these records instead.
+    localEntry = userCache.get(screenName) || null;
     if (localEntry) {
         if (debug23) console.log(`[xposed#23] @${screenName} source=local (no richer cloud record)`);
         return {
@@ -358,7 +359,11 @@ async function _resolveUserInfo({ screenName, csrfToken }) {
 
     // 3. Fetch from X API (genuine cache miss only)
     try {
-        const data = await apiClient.fetchUserInfo(screenName, csrfToken);
+        const data = {
+            ...await apiClient.fetchUserInfo(screenName, csrfToken),
+            timestamp: Date.now(),
+            fromCloud: false
+        };
         if (debug23) console.log(`[xposed#23] @${screenName} source=api loc=${data?.location}`);
 
         // Cache the result locally
@@ -426,7 +431,11 @@ async function handleFetchHovercardInfo({ screenName, csrfToken }) {
     }
 
     try {
-        const data = await apiClient.fetchUserInfo(screenName, csrfToken);
+        const data = {
+            ...await apiClient.fetchUserInfo(screenName, csrfToken),
+            timestamp: Date.now(),
+            fromCloud: false
+        };
 
         // Persist enriched response locally to speed up future hovers
         userCache.set(screenName, data);
@@ -505,8 +514,7 @@ function handleSetCache({ action, screenName, data }) {
     }
 
     if (screenName && data) {
-        userCache.set(screenName, data);
-        return { success: true };
+        return { success: userCache.set(screenName, data) };
     }
 
     return { success: false, error: 'Invalid cache operation' };
@@ -906,7 +914,9 @@ async function handleSyncLocalToCloud() {
                 cacheEntries[entry.screenName] = {
                     location: entry.location,
                     device: entry.device,
-                    locationAccurate: entry.locationAccurate
+                    locationAccurate: entry.locationAccurate,
+                    timestamp: entry.timestamp,
+                    fromCloud: entry.fromCloud
                 };
             }
         }
@@ -1013,8 +1023,13 @@ async function handleImportData({ settings: importSettings, blockedCountries: im
         if (Array.isArray(importCache)) {
             for (const entry of importCache) {
                 if (entry.screenName) {
-                    userCache.set(entry.screenName, entry);
-                    results.cache.count++;
+                    // Older exports have no observation time. Do not give them a
+                    // new full cache lifetime simply because they were imported.
+                    const accepted = userCache.set(entry.screenName, {
+                        ...entry,
+                        timestamp: entry.timestamp ?? null
+                    });
+                    if (accepted) results.cache.count++;
                 }
             }
         }

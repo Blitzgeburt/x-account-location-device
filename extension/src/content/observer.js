@@ -3,11 +3,13 @@
  * Handles DOM observation, user processing, and caching
  */
 
-import { SELECTORS, CSS_CLASSES, MESSAGE_TYPES, TIMING, canonicalCountry } from '../shared/constants.js';
+import { SELECTORS, CSS_CLASSES, MESSAGE_TYPES, TIMING, canonicalCountry, GOVERNMENT_LABEL } from '../shared/constants.js';
 import { extractUsername, findInsertionPoint, getLoggedInUsername, extractTagsFromText, getDeviceCountry } from '../shared/utils.js';
 import { createBadge, findUserCellInsertionPoint, showRateLimitToast } from './ui.js';
 import { LRUCache } from '../shared/lru-cache.js';
 import { getProfile } from './profile-cache.js';
+import { isFocalTweet, ownPostId } from './post-identity.js';
+import { hasGovernmentBadge, VERIFIED_BADGE_SELECTOR } from './government-badge.js';
 
 /**
  * Resolve the country used for the flag, the xCountry dataset, and country/region
@@ -28,6 +30,34 @@ function effectiveCountry(info, flagFromDevice) {
 }
 
 /**
+ * Which filter blocked this account, or '' if none did.
+ *
+ * The verdict used to be computed as one OR'd boolean in two separate places
+ * (applyInfoToElement and runUpdateBlockedTweets), which meant the two could drift
+ * apart and the reason was thrown away the moment it was known. Both now call this,
+ * so they cannot disagree, and the surviving reason is what labels a collapsed quote
+ * card (issue #42).
+ *
+ * Order is precedence, not importance: an account can trip several filters at once and
+ * the reader only sees one label, so the most concrete reason wins. Location first (it
+ * is what this extension is for), then the text filters, then affiliation.
+ *
+ * @param {Object} r - reason flags, each already resolved by the caller
+ * @returns {'country'|'region'|'tag'|'bio'|'label'|'affiliation'|''}
+ */
+function resolveBlockReason({ isExempt, isBlockedCountry, isBlockedRegion, isTagBlocked,
+    isBioBlocked, isLabelBlocked, isAffiliationBlocked }) {
+    if (isExempt) return '';
+    if (isBlockedCountry) return 'country';
+    if (isBlockedRegion) return 'region';
+    if (isTagBlocked) return 'tag';
+    if (isBioBlocked) return 'bio';
+    if (isLabelBlocked) return 'label';
+    if (isAffiliationBlocked) return 'affiliation';
+    return '';
+}
+
+/**
  * Apply a row's block/highlight/VPN state to the username element and its tweet
  * article AUTHORITATIVELY: every reason re-sets the marker it owns and clears the
  * ones that no longer apply. This is what lets the timeline recover when a setting
@@ -35,23 +65,23 @@ function effectiveCountry(info, flagFromDevice) {
  * hidden under a previous setting — the old code only ever ADDED markers, so a hidden
  * row stayed hidden until a hard reload.
  *
- * VPN-hide is a hard filter (always hides when on); country/region/tag blocks honor
- * the hide-vs-highlight preference. The persistent data-x-block marker lets CSS :has()
- * keep the article styled even after X re-renders it and wipes our class.
+ * All filters honor the hide-vs-highlight preference. The persistent data-x-block
+ * marker lets CSS :has() keep the article styled after X wipes our class.
  *
  * Shared by the per-element resolution path (applyInfoToElement) and the bulk
  * re-derive pass (runUpdateBlockedTweets) so the two can never disagree about a row.
  * @param {HTMLElement} element
  * @param {HTMLElement|null} tweet
- * @param {{isListBlocked: boolean, isVpnHidden: boolean, highlightMode: boolean, isQuote?: boolean, neverHide?: boolean}} state
+ * @param {{isListBlocked: boolean, isVpnHidden: boolean, highlightMode: boolean, isQuote?: boolean, neverHide?: boolean, reason?: string}} state
  * @returns {{hide: boolean, highlight: boolean}}
  */
-function applyBlockState(element, tweet, { isListBlocked, isVpnHidden, highlightMode, isQuote = false, neverHide = false }) {
+function applyBlockState(element, tweet, { isListBlocked, isVpnHidden, highlightMode, isQuote = false, neverHide = false, reason = '' }) {
     // A quoted author lives INSIDE someone else's tweet, so it must never decide the
     // fate of the row (issue #32) — the article-level `:has([data-x-block="hide"])`
     // rule can't tell a quoted marker from the main author's. Mark the quoted username
     // element in its own namespace instead and let CSS collapse only the quote card.
     if (isQuote) {
+        delete element.dataset.xBlock;
         const quoteHighlight = isListBlocked && highlightMode;
         // Never re-collapse a card the reader explicitly revealed (see setupQuoteReveal).
         // Element recycling deletes the marker, so a reused row can't inherit 'shown'.
@@ -59,24 +89,32 @@ function applyBlockState(element, tweet, { isListBlocked, isVpnHidden, highlight
             element.dataset.xQuoteBlock = isListBlocked
                 ? (highlightMode ? 'highlight' : 'hide')
                 : '';
+            // Names the filter on the collapsed card's placeholder (issue #42). Written
+            // alongside the verdict it belongs to, and cleared with it, so a row that
+            // stops being blocked — or gets recycled — can never keep a stale reason.
+            element.dataset.xQuoteReason = isListBlocked ? reason : '';
         }
         // Always report hide:false: the row stays, and the badge is still built so it's
         // already in place inside the card when the reader reveals it.
         return { hide: false, highlight: quoteHighlight };
     }
 
+    delete element.dataset.xQuoteBlock;
+    delete element.dataset.xQuoteReason;
+
     // People lists (Followers, Verified followers, Following) only ever FLAG a row.
-    // Removing someone from your own follower list hides the very information you opened
-    // the page to read, and leaves the count looking wrong. So there every reason to block
-    // — including VPN-hide, which is otherwise a hard filter — degrades to a highlight.
-    const hide = !neverHide && (isVpnHidden || (isListBlocked && !highlightMode));
-    const highlight = !hide && (neverHide
-        ? (isListBlocked || isVpnHidden)
-        : (isListBlocked && highlightMode));
+    // Removing someone from your own follower list hides the information you opened
+    // the page to read, and leaves the count looking wrong. Every filter highlights there.
+    const matchesFilter = isListBlocked || isVpnHidden;
+    // The post deliberately opened by its own timestamp remains readable. This
+    // runs after the quote branch, so its quoted authors retain independent rules.
+    const keepVisible = neverHide || isFocalTweet(tweet);
+    const hide = !keepVisible && matchesFilter && !highlightMode;
+    const highlight = !hide && matchesFilter;
 
     if (tweet) {
         tweet.classList.toggle(CSS_CLASSES.TWEET_BLOCKED, hide);
-        tweet.classList.toggle('x-tweet-vpn-blocked', isVpnHidden);
+        tweet.classList.toggle('x-tweet-vpn-blocked', isVpnHidden && hide);
         tweet.classList.toggle('x-tweet-highlighted', highlight);
     }
     element.dataset.xBlock = hide ? 'hide' : (highlight ? 'highlight' : '');
@@ -91,7 +129,7 @@ function applyBlockState(element, tweet, { isListBlocked, isVpnHidden, highlight
  * hit, in-flight resolved, fresh API response) so they behave identically.
  * @param {HTMLElement} element
  * @param {string} screenName
- * @param {{location?: string, device?: string, locationAccurate?: boolean}} info
+ * @param {{location?: string, device?: string, locationAccurate?: boolean}|null} info
  * @param {Object} opts
  * @param {Set} opts.blockedCountries - lowercase blocked country names
  * @param {Set} [opts.blockedRegions] - lowercase blocked region names
@@ -123,32 +161,38 @@ function applyInfoToElement(element, screenName, info, opts) {
     const isQuote = isInsideQuoteTweet(element, tweet);
     // Who-they-are filters (country/region/tag) apply to quoted authors too — they just
     // collapse the quote card instead of the row (issue #32).
-    const affiliationBlocked = hasBlockedAffiliation(info.meta, blockedAffiliations);
+    const affiliationBlocked = hasBlockedAffiliation(info?.meta, blockedAffiliations);
     // Bio and account label come from the profile data X already sent with the timeline,
     // so neither costs a lookup — see profile-cache.js.
     const bioBlocked = hasBlockedBio(screenName, blockedBioTags);
     const labelBlocked = hasBlockedAccountLabel(element, tweet, screenName, blockedPcf);
-    const matchesBlockList =
-        ((locationLower !== '' &&
-            (blockedCountries.has(locationLower) || (blockedRegions && blockedRegions.has(locationLower)))) ||
-            tagBlocked || affiliationBlocked || bioBlocked || labelBlocked) &&
-        !isExempt;
-    // VPN-hide is a hard filter, but only for the MAIN author: a quoted account being
-    // flagged as proxied must never hide the quoting user's own post.
+    const blockReason = resolveBlockReason({
+        isExempt,
+        isBlockedCountry: locationLower !== '' && blockedCountries.has(locationLower),
+        isBlockedRegion: locationLower !== '' && !!blockedRegions && blockedRegions.has(locationLower),
+        isTagBlocked: tagBlocked,
+        isBioBlocked: bioBlocked,
+        isLabelBlocked: labelBlocked,
+        isAffiliationBlocked: affiliationBlocked
+    });
+    const matchesBlockList = blockReason !== '';
+    // Location uncertainty is filtered only for the MAIN author: a quoted account
+    // must never hide the quoting user's own post.
     const isVpnHidden =
-        !isQuote && info.locationAccurate === false && settings.showVpnUsers === false && !isExempt;
+        !isQuote && info?.locationAccurate === false && settings.showVpnUsers === false && !isExempt;
 
     const { hide } = applyBlockState(element, tweet, {
         isListBlocked: matchesBlockList,
         isVpnHidden,
         highlightMode: settings.highlightBlockedTweets === true,
         isQuote,
-        neverHide: isUserCell
+        neverHide: isUserCell,
+        reason: blockReason
     });
 
     if (hide) return; // hidden row → don't build a badge
 
-    if (info.location || info.device) {
+    if (info?.location || info?.device) {
         try {
             createBadge(element, screenName, info, isUserCell, settings, debug, csrfToken, effCountry);
         } catch (badgeError) {
@@ -277,7 +321,8 @@ function applyLanguageBlock(tweet, blockedLanguages, settings, allowedUsers) {
     }
 
     if (blocked) {
-        tweet.dataset.xLangBlock = settings.highlightBlockedTweets === true ? 'highlight' : 'hide';
+        tweet.dataset.xLangBlock = settings.highlightBlockedTweets === true || isFocalTweet(tweet)
+            ? 'highlight' : 'hide';
     } else if (tweet.dataset.xLangBlock) {
         delete tweet.dataset.xLangBlock;
     }
@@ -309,6 +354,66 @@ const PENDING_VISIBILITY_MAX_SIZE = 500;
 const PROCESSING_QUEUE_MAX_SIZE = 200;
 export const processingQueue = new Map();
 
+// Each processing attempt owns its row until another attempt or a settings reset
+// replaces it. Network replies may arrive after X has recycled the same DOM node.
+let elementProcessingTokens = new WeakMap();
+let elementTweetContexts = new WeakMap();
+let elementQuoteContexts = new WeakMap();
+let postContexts = new WeakMap();
+
+function hasChangedElementContext(element) {
+    if (!elementTweetContexts.has(element)) return false;
+    const tweet = element.closest(SELECTORS.TWEET);
+    return elementTweetContexts.get(element) !== tweet ||
+        elementQuoteContexts.get(element) !== isInsideQuoteTweet(element, tweet);
+}
+
+// A lookup can outlive list/allowlist changes without the row being recycled.
+// Keep the latest broadcast available to delayed applies as soon as it arrives,
+// including before the coalesced DOM update runs on the next animation frame.
+let filterRevision = 0;
+let latestFilterSnapshot = null;
+
+const LOOKUP_RETRY_DELAY_MS = 60000;
+
+function clearRetryState(element) {
+    delete element.dataset.xRetryAfter;
+    delete element.dataset.xRetryScreenName;
+}
+
+/** A retry belongs to the account that failed, never to a recycled row. */
+function isRetryDeferred(element, currentName) {
+    if (!element.dataset.xRetryAfter) return false;
+    if (currentName === undefined) {
+        currentName = element.matches(SELECTORS.USER_CELL)
+            ? extractUsernameFromUserCell(element)
+            : extractUsername(element);
+    }
+    if (currentName && currentName.toLowerCase() !== element.dataset.xRetryScreenName?.toLowerCase()) {
+        clearRetryState(element);
+        return false;
+    }
+    return Date.now() < Number(element.dataset.xRetryAfter);
+}
+
+function retryDeadline(response) {
+    const now = Date.now();
+    const reset = typeof response?.retryAfter === 'number'
+        ? response.retryAfter
+        : Date.parse(response?.retryAfter);
+    return response?.code === 'RATE_LIMITED' && Number.isFinite(reset) && reset > now
+        ? reset
+        : now + LOOKUP_RETRY_DELAY_MS;
+}
+
+function deferElementRetry(element, screenName, retryAt) {
+    element.dataset.xRetryAfter = String(retryAt);
+    element.dataset.xRetryScreenName = screenName;
+    // Keep xScreenName and local filter markers so later profile/list updates
+    // remain effective. Existing scans can queue this row once its deadline passes.
+    delete element.dataset.xProcessed;
+}
+
 // Toast cooldown tracking
 let lastRateLimitToastTime = 0;
 
@@ -321,22 +426,51 @@ export const observerCleanupFunctions = [];
 
 /**
  * Extract display name including emojis from an element
- * X renders emojis as <img alt="emoji"> tags, so we need to reconstruct the full text
+ * X renders emojis as images (sometimes with an empty alt), so reconstruct the text.
  * @param {HTMLElement} element - The username element
  * @returns {string} - Display name with emojis
  */
 function extractDisplayName(element) {
-    // Find the tweet or user cell
+    // Prefer this author's own username container. Searching the whole article
+    // reads the main author's name again when processing a quoted author (#57).
     const tweet = element.closest(SELECTORS.TWEET);
     const userCell = element.closest(SELECTORS.USER_CELL);
-    const container = tweet || userCell;
+    const ownName = element.closest(SELECTORS.USERNAME);
+    const quoteCard = isInsideQuoteTweet(element, tweet)
+        ? element.closest(QUOTE_CARD_SELECTOR)
+        : null;
+    const container = ownName || quoteCard || userCell || tweet;
     if (!container) return '';
+
+    const belongsToAuthor = node => !tweet || !!quoteCard || !isInsideQuoteTweet(node, tweet);
+    const isProfileLink = node => /^\/[a-zA-Z0-9_]{1,15}\/?$/.test(node.getAttribute('href') || '');
     
     // Method 1: Look for User-Name testid which contains display name and @handle
-    const userNameContainer = container.querySelector('[data-testid="User-Name"]');
+    const userNameContainer = ownName || Array.from(container.querySelectorAll(SELECTORS.USERNAME))
+        .find(belongsToAuthor);
     if (userNameContainer) {
+        // Captured X markup puts the display-name text in the first directional
+        // block of the first group. In quotes this group has no profile anchor.
+        // Read only that field, not the sibling handle, time or affiliation badge.
+        // A real display name may itself begin with @; this is not the handle field.
+        const nameGroup = userNameContainer.firstElementChild;
+        const nameField = nameGroup?.matches('div[dir]')
+            ? nameGroup
+            : nameGroup?.querySelector('div[dir]');
+        const handleGroup = nameGroup?.nextElementSibling;
+        const hasSeparateHandle = handleGroup && Array.from(handleGroup.querySelectorAll('span'))
+            .some(span => /^@[a-zA-Z0-9_]{1,15}$/.test(span.textContent.trim()));
+        // An incomplete header may contain only the handle group. Do not treat
+        // that as a name while X is still constructing or recycling the row.
+        if (hasSeparateHandle && nameField && !nameField.querySelector('time') &&
+            nameField.closest(SELECTORS.USERNAME) === userNameContainer) {
+            const displayName = extractTextWithEmojis(nameField);
+            if (displayName) return displayName;
+        }
+
         // The first link usually contains the display name
-        const displayNameLink = userNameContainer.querySelector('a[href^="/"]');
+        const displayNameLink = Array.from(userNameContainer.querySelectorAll('a[href^="/"]'))
+            .find(isProfileLink);
         if (displayNameLink) {
             const displayName = extractTextWithEmojis(displayNameLink);
             if (displayName && !displayName.startsWith('@')) {
@@ -348,6 +482,7 @@ function extractDisplayName(element) {
     // Method 2: Look for profile links with role="link"
     const profileLinks = container.querySelectorAll('a[href^="/"][role="link"]');
     for (const link of profileLinks) {
+        if (!belongsToAuthor(link) || !isProfileLink(link)) continue;
         const displayName = extractTextWithEmojis(link);
         // Skip if it looks like a @username or if it's empty
         if (displayName && !displayName.startsWith('@') && displayName.length > 0) {
@@ -368,7 +503,24 @@ function extractDisplayName(element) {
 }
 
 /**
- * Extract text content including emoji alt text from an element
+ * Read an emoji image without guessing from its title or arbitrary asset URLs.
+ * Some current X emoji images have alt="" but retain the Unicode SVG filename.
+ * @param {HTMLImageElement} image
+ * @returns {string}
+ */
+function emojiImageText(image) {
+    if (image.alt) return image.alt;
+    const match = /^https:\/\/abs(?:-\d+)?\.twimg\.com\/emoji\/v\d+\/svg\/([a-f0-9]+(?:-[a-f0-9]+)*)\.svg(?:[?#].*)?$/i
+        .exec(image.getAttribute('src') || '');
+    if (!match) return '';
+    const points = match[1].split('-').map(point => parseInt(point, 16));
+    if (points.length > 32 || points.some(point => point < 0x20 || point > 0x10ffff ||
+        (point >= 0xd800 && point <= 0xdfff))) return '';
+    return String.fromCodePoint(...points);
+}
+
+/**
+ * Extract text content including emoji image text from an element
  * @param {HTMLElement} element - Element to extract text from
  * @returns {string} - Text with emojis
  */
@@ -381,7 +533,7 @@ function extractTextWithEmojis(element) {
         {
             acceptNode: node => {
                 if (node.nodeType === Node.TEXT_NODE) return NodeFilter.FILTER_ACCEPT;
-                if (node.nodeName === 'IMG' && node.alt) return NodeFilter.FILTER_ACCEPT;
+                if (node.nodeName === 'IMG') return NodeFilter.FILTER_ACCEPT;
                 return NodeFilter.FILTER_SKIP;
             }
         }
@@ -391,8 +543,8 @@ function extractTextWithEmojis(element) {
     while ((node = walker.nextNode())) {
         if (node.nodeType === Node.TEXT_NODE) {
             result += node.textContent;
-        } else if (node.nodeName === 'IMG' && node.alt) {
-            result += node.alt;
+        } else if (node.nodeName === 'IMG') {
+            result += emojiImageText(node);
         }
     }
     
@@ -435,7 +587,7 @@ function hasBlockedAffiliation(meta, blockedAffiliations) {
 }
 
 // ============================================
-// ACCOUNT TYPE LABEL — Parody / Commentary / Fan (issue #41)
+// ACCOUNT LABEL — Parody / Commentary / Fan (#41) and grey verification (#48)
 // ============================================
 
 // X's authenticity labels render on BOTH the timeline row and the profile header, but not
@@ -569,7 +721,7 @@ function hasBlockedBio(screenName, blockedBioTags) {
 }
 
 /**
- * Does this account carry a blocked Parody / Commentary / Fan label (issue #41)?
+ * Does this account carry a selected authenticity label or grey badge?
  *
  * Prefers X's STRUCTURED `parody_commentary_fan_label`, harvested from its own responses —
  * exact, and locale-independent. Falls back to the label rendered in the DOM, which is what
@@ -584,12 +736,18 @@ function hasBlockedBio(screenName, blockedBioTags) {
 function hasBlockedAccountLabel(element, tweet, screenName, blockedPcf) {
     if (!blockedPcf || blockedPcf.size === 0) return false;
 
+    // Grey verification is independent of the PCF enum. A parody label must not
+    // suppress grey-badge detection, and an arbitrary raw PCF string must never
+    // stand in for a government badge. No extra lookup is required (#48).
+    if (blockedPcf.has(GOVERNMENT_LABEL) && hasGovernmentBadge(element)) return true;
+    if (blockedPcf.size === 1 && blockedPcf.has(GOVERNMENT_LABEL)) return false;
     const structured = getProfile(screenName)?.pcf;
-    if (structured) return blockedPcf.has(structured);
+    if (structured) return structured !== GOVERNMENT_LABEL && blockedPcf.has(structured);
 
     const tokens = getAccountTypeTokens(element, tweet);
     if (!tokens) return false;
     for (const value of blockedPcf) {
+        if (value === GOVERNMENT_LABEL) continue;
         for (const token of tokens) {
             if (token.includes(value)) return true;
         }
@@ -698,6 +856,12 @@ export function startIntersectionObserver(processElementSafe, _debug) {
  * Queue element for processing when visible
  */
 export function queueForVisibility(element, processElementSafe, debug) {
+    if (hasChangedElementContext(element)) {
+        const screenName = element.matches(SELECTORS.USER_CELL)
+            ? extractUsernameFromUserCell(element) : extractUsername(element);
+        releaseElementMarkers(element, screenName);
+    }
+    if (isRetryDeferred(element)) return;
     if (!intersectionObserver) {
         processElementSafe(element);
         return;
@@ -727,7 +891,7 @@ export function queueForVisibility(element, processElementSafe, debug) {
 /**
  * Start MutationObserver for DOM changes
  */
-export function startObserver(isEnabled, processElementSafe, scanPage, debug) {
+export function startObserver(isEnabled, processElementSafe, scanPage, debug, getFilters) {
     if (observer) return;
     
     // Start Intersection Observer
@@ -735,6 +899,18 @@ export function startObserver(isEnabled, processElementSafe, scanPage, debug) {
 
     let pendingElements = new Set();
     let processTimeout = null;
+    let contextFrame = null;
+
+    const scheduleContextRefresh = () => {
+        if (contextFrame !== null) return;
+        contextFrame = requestAnimationFrame(() => {
+            contextFrame = null;
+            if (!isEnabled()) return;
+            releaseRecycledElements(debug);
+            refreshPostContext(getFilters?.() || latestFilterSnapshot, processElementSafe);
+            scanPage();
+        });
+    };
 
     const processPending = () => {
         if (pendingElements.size === 0) return;
@@ -755,11 +931,10 @@ export function startObserver(isEnabled, processElementSafe, scanPage, debug) {
         }, 50);
     };
 
-    // Re-derive recycled rows after an in-place SPA navigation, then rescan so the
-    // released elements are picked up again (issue #40).
+    // Post identity and focal status can change while the author stays the same.
     const onNavigate = () => {
         if (!isEnabled()) return;
-        if (releaseRecycledElements(debug) > 0) scanPage();
+        scheduleContextRefresh();
     };
     startNavigationWatcher(onNavigate);
 
@@ -770,12 +945,38 @@ export function startObserver(isEnabled, processElementSafe, scanPage, debug) {
         checkForNavigation(onNavigate);
 
         for (const mutation of mutations) {
+            if (mutation.type === 'attributes') {
+                // Only timestamp anchor hrefs can change an existing post's ID.
+                if (mutation.target.tagName === 'A' && mutation.target.querySelector('time') &&
+                    mutation.target.closest(SELECTORS.TWEET)) scheduleContextRefresh();
+                if (mutation.attributeName === 'fill' &&
+                    mutation.target.closest(VERIFIED_BADGE_SELECTOR)?.closest(SELECTORS.USERNAME)) {
+                    scheduleContextRefresh();
+                }
+                continue;
+            }
+            for (const node of [...mutation.addedNodes, ...mutation.removedNodes]) {
+                if (node.nodeType === Node.ELEMENT_NODE &&
+                    (node.matches(`time, ${SELECTORS.TWEET}, ${SELECTORS.USERNAME}`) ||
+                    node.querySelector(`time, ${SELECTORS.TWEET}, ${SELECTORS.USERNAME}`))) {
+                    scheduleContextRefresh();
+                }
+                // A badge/path may arrive, change or disappear without replacing
+                // its already-processed author. Re-evaluate locally in the same
+                // coalesced pass; never cache a government verdict by username.
+                if (node.nodeType === Node.ELEMENT_NODE &&
+                    mutation.target.closest?.(SELECTORS.USERNAME) &&
+                    (node.matches(VERIFIED_BADGE_SELECTOR) || node.querySelector(VERIFIED_BADGE_SELECTOR) ||
+                        mutation.target.closest?.(VERIFIED_BADGE_SELECTOR))) {
+                    scheduleContextRefresh();
+                }
+            }
             for (const node of mutation.addedNodes) {
                 if (node.nodeType !== Node.ELEMENT_NODE) continue;
 
                 // Check if the node itself matches (single combined check)
                 if (node.matches && node.matches(COMBINED_USER_SELECTOR)) {
-                    if (!node.dataset.xProcessed) {
+                    if (!node.dataset.xProcessed || hasChangedElementContext(node)) {
                         pendingElements.add(node);
                     }
                 }
@@ -788,7 +989,7 @@ export function startObserver(isEnabled, processElementSafe, scanPage, debug) {
                     const elements = node.querySelectorAll(COMBINED_USER_SELECTOR);
                     for (let i = 0; i < elements.length; i++) {
                         const el = elements[i];
-                        if (!el.dataset.xProcessed) {
+                        if (!el.dataset.xProcessed || hasChangedElementContext(el)) {
                             pendingElements.add(el);
                         }
                     }
@@ -803,16 +1004,23 @@ export function startObserver(isEnabled, processElementSafe, scanPage, debug) {
 
     observer.observe(document.body, {
         childList: true,
-        subtree: true
+        subtree: true,
+        attributes: true,
+        attributeFilter: ['href', 'fill']
     });
 
     // Initial scan
     scanPage();
+    scheduleContextRefresh();
     
     // Delayed scan after X loads
-    setTimeout(() => scanPage(), 2000);
+    const initialScanTimeout = setTimeout(() => scanPage(), 2000);
     
     observerCleanupFunctions.push(() => {
+        clearTimeout(initialScanTimeout);
+        if (processTimeout !== null) clearTimeout(processTimeout);
+        if (contextFrame !== null) cancelAnimationFrame(contextFrame);
+        pendingElements.clear();
         if (observer) {
             observer.disconnect();
             observer = null;
@@ -891,6 +1099,7 @@ export async function processElement(element, {
     debug,
     debugMode
 }) {
+    if (!element.isConnected) return;
     const isUserCell = element.matches && element.matches(SELECTORS.USER_CELL);
     
     const screenName = isUserCell
@@ -906,40 +1115,47 @@ export async function processElement(element, {
         if (debug) debug(`Invalid screen name rejected: ${screenName.substring(0, 20)}...`);
         return;
     }
+    const tweet = element.closest(SELECTORS.TWEET);
+    const isQuoteAtStart = isInsideQuoteTweet(element, tweet);
+    const movedToAnotherTweet = hasChangedElementContext(element);
+    if (isRetryDeferred(element, screenName)) return;
+    clearRetryState(element);
     
     // Handle element recycling
-    if (element.dataset.xProcessed) {
+    if (element.dataset.xScreenName) {
         const previousScreenName = element.dataset.xScreenName;
-        if (previousScreenName === screenName) {
+        if (previousScreenName === screenName && !movedToAnotherTweet) {
             // Already resolved for this user, and the outcome is terminal: a badge means a
             // visible row; data-x-block="hide" means we deliberately hid it (VPN or a list
             // block). Either way, don't reprocess on every scan — that was a per-scan busy
             // loop on badge-less hidden rows. Recovery still happens because a settings
             // change clears xProcessed (see content-script SETTINGS_UPDATED) and a
             // blocked-list change re-derives directly via runUpdateBlockedTweets.
-            if (element.querySelector(`.${CSS_CLASSES.INFO_BADGE}`) || element.dataset.xBlock === 'hide') {
+            if (element.dataset.xProcessed &&
+                (element.querySelector(`.${CSS_CLASSES.INFO_BADGE}`) || element.dataset.xBlock === 'hide')) {
                 return;
             }
         } else {
             if (debug) debug(`Element recycled: @${previousScreenName} → @${screenName}`);
-            const oldBadge = element.querySelector(`.${CSS_CLASSES.INFO_BADGE}`);
-            if (oldBadge) oldBadge.remove();
-            delete element.dataset.xProcessed;
-            delete element.dataset.xScreenName;
-            delete element.dataset.xCountry;
-            delete element.dataset.xBlock;
-            delete element.dataset.xQuoteBlock;
+            releaseElementMarkers(element, screenName);
         }
     }
     
     element.dataset.xProcessed = 'true';
     element.dataset.xScreenName = screenName;
+    const processingToken = {};
+    elementProcessingTokens.set(element, processingToken);
+    elementTweetContexts.set(element, tweet);
+    elementQuoteContexts.set(element, isQuoteAtStart);
+    const isCurrentElement = () => {
+        if (!element.isConnected || elementProcessingTokens.get(element) !== processingToken ||
+            element.dataset.xScreenName !== screenName || element.closest(SELECTORS.TWEET) !== tweet ||
+            isInsideQuoteTweet(element, tweet) !== isQuoteAtStart) return false;
+        const currentName = isUserCell ? extractUsernameFromUserCell(element) : extractUsername(element);
+        return currentName?.toLowerCase() === screenName.toLowerCase();
+    };
 
     if (debug) debug(`Processing @${screenName}`);
-
-    // Resolve the enclosing tweet article ONCE and reuse it everywhere below
-    // (including inside isInsideQuoteTweet) to avoid repeated closest() walks.
-    const tweet = element.closest(SELECTORS.TWEET);
 
     // Language blocking is a per-tweet signal (X's own lang tag), independent of the
     // author lookup — apply it eagerly here, before any early return below, so
@@ -956,39 +1172,12 @@ export async function processElement(element, {
         return;
     }
 
-    // Detect a blocked tag in the display name up front. In HIDE mode we can short-circuit
-    // here (no badge needed) and skip the API call entirely; in HIGHLIGHT mode we still
-    // need the badge, so we only remember the verdict and let applyInfoToElement apply it
-    // together with the country/region/VPN checks (one authoritative pass).
-    let tagBlocked = false;
-    if (blockedTags && blockedTags.size > 0) {
-        const displayName = extractDisplayName(element);
-        if (displayName && hasBlockedTag(displayName, blockedTags)) {
-            const isQuote = isInsideQuoteTweet(element, tweet);
-            const loggedInUser = getLoggedInUsername();
-            const isSelf = loggedInUser && screenName.toLowerCase() === loggedInUser.toLowerCase();
-            // Allowlisted accounts are never blocked, even by a display-name tag (issue #26).
-            const isExempt = isSelf || (allowedUsers && allowedUsers.has(screenName.toLowerCase()));
-
-            if (!isExempt) {
-                tagBlocked = true;
-                if (debug) debug(`Blocked @${screenName} due to tag in display name: "${displayName}"`);
-
-                // Only the MAIN author's tag can hide the whole row, so only that case
-                // can short-circuit here. A quoted author's tag collapses just the quote
-                // card, which applyInfoToElement resolves alongside country/region (#32).
-                if (!isQuote && tweet && settings.highlightBlockedTweets !== true) {
-                    applyBlockState(element, tweet, { isListBlocked: true, isVpnHidden: false, highlightMode: false });
-                    return;
-                }
-            }
-        }
-    }
-
     // Shared opts for applyInfoToElement across all three resolution paths
     const applyOpts = {
         blockedCountries,
         blockedRegions,
+        blockedTags,
+        blockedLanguages,
         blockedAffiliations,
         blockedBioTags,
         blockedPcf,
@@ -997,44 +1186,56 @@ export async function processElement(element, {
         isUserCell,
         tweet,
         debug,
-        csrfToken,
-        tagBlocked
+        csrfToken
     };
+    const startedFilterRevision = filterRevision;
+    const applyCurrentInfo = info => {
+        if (!isCurrentElement()) return;
+        const currentOpts = latestFilterSnapshot && filterRevision !== startedFilterRevision
+            ? { ...applyOpts, ...latestFilterSnapshot }
+            : applyOpts;
+        applyLanguageBlock(tweet, currentOpts.blockedLanguages, currentOpts.settings, currentOpts.allowedUsers);
+        applyInfoToElement(element, screenName, info, {
+            ...currentOpts,
+            tagBlocked: currentOpts.blockedTags?.size > 0 &&
+                hasBlockedTag(extractDisplayName(element), currentOpts.blockedTags)
+        });
+    };
+
+    // Name/bio/label filters already have their inputs, even if location is unknown,
+    // negatively cached, or a lookup fails. Apply them before any network work (#57).
+    // A quoted verdict only collapses its card; the lookup can still populate its badge.
+    applyCurrentInfo(userInfoCache.get(screenName) || null);
 
     // Check local cache
     if (userInfoCache.has(screenName)) {
         if (debug) debug(`Using local cache for @${screenName}`);
-        const info = userInfoCache.get(screenName);
-        if (info) {
-            applyInfoToElement(element, screenName, info, applyOpts);
-        }
         return;
     }
+    if (element.dataset.xBlock === 'hide') return;
 
     // Check if request in flight - use promise-based waiting instead of arbitrary timeout
     if (processingQueue.has(screenName)) {
         // Wait for the in-flight request to complete using the stored promise
         const pendingPromise = processingQueue.get(screenName);
+        let result;
         if (pendingPromise && typeof pendingPromise.then === 'function') {
             try {
-                await pendingPromise;
+                result = await pendingPromise;
             } catch {
                 // Ignore errors - we'll check cache below
             }
         }
         
-        // Now check if cache was populated
-        if (userInfoCache.has(screenName)) {
-            const info = userInfoCache.get(screenName);
-            if (info) {
-                applyInfoToElement(element, screenName, info, applyOpts);
-            }
-        }
+        // The row may have changed while waiting; applyCurrentInfo checks ownership.
+        applyCurrentInfo(userInfoCache.get(screenName) || null);
+        if (result?.retryAt && isCurrentElement()) deferElementRetry(element, screenName, result.retryAt);
         return;
     }
 
     // Create the processing promise and store it for waiting
     let resolveProcessing;
+    let retryAt = null;
     const processingPromise = new Promise(resolve => {
         resolveProcessing = resolve;
     });
@@ -1050,7 +1251,7 @@ export async function processElement(element, {
     processingQueue.set(screenName, processingPromise);
     
     const processingTimeout = setTimeout(() => {
-        if (processingQueue.has(screenName)) {
+        if (processingQueue.get(screenName) === processingPromise) {
             if (debug) debug(`Cleaning up stale processing entry for @${screenName}`);
             processingQueue.delete(screenName);
             resolveProcessing();
@@ -1081,8 +1282,10 @@ export async function processElement(element, {
         // page's own correct session — then cache the result via the background.
         if ((response?.code === 'UNAUTHORIZED' || response?.code === 'NO_HEADERS') && fetchUserInfoViaPage) {
             const pageResponse = await fetchUserInfoViaPage(screenName);
+            // Keep the page's actual failure code too, so a rate limit or timeout
+            // isn't mislabeled as the background's original authentication failure.
+            if (pageResponse) response = { ...pageResponse, source: 'page' };
             if (pageResponse?.success) {
-                response = { ...pageResponse, source: 'page' };
                 await sendMessage({
                     type: MESSAGE_TYPES.SET_CACHE,
                     payload: { screenName, data: pageResponse.data }
@@ -1093,6 +1296,12 @@ export async function processElement(element, {
         if (shimmer) shimmer.remove();
 
         if (!response?.success || !response.data) {
+            const code = response?.code;
+            const isTransient = code === 'RATE_LIMITED' || code === 'NETWORK_ERROR' || code === 'TIMEOUT';
+            if (isTransient) retryAt = retryDeadline(response);
+            if (!isCurrentElement()) return;
+            applyCurrentInfo(null);
+            if (retryAt) deferElementRetry(element, screenName, retryAt);
             if (response?.code === 'RATE_LIMITED') {
                 const resetDate = response.retryAfter ? new Date(response.retryAfter) : null;
                 let resetStr = 'unknown';
@@ -1131,8 +1340,6 @@ export async function processElement(element, {
             // are captured — rather than being negative-cached for the session.
             if (response?.code === 'UNAUTHORIZED' || response?.code === 'NO_HEADERS') {
                 delete element.dataset.xProcessed;
-                delete element.dataset.xScreenName;
-                processingQueue.delete(screenName);
                 return;
             }
 
@@ -1140,12 +1347,9 @@ export async function processElement(element, {
             // network) for the session — caching null used to blank the user until LRU
             // eviction or a reload, even after the condition cleared. Only genuine
             // misses (not-found/unknown) are negative-cached.
-            const code = response?.code;
-            const isTransient = code === 'RATE_LIMITED' || code === 'NETWORK_ERROR';
             if (!isTransient) {
                 userInfoCache.set(screenName, null);
             }
-            processingQueue.delete(screenName);
             return;
         }
 
@@ -1154,22 +1358,73 @@ export async function processElement(element, {
 
         userInfoCache.set(screenName, info);
 
-        applyInfoToElement(element, screenName, info, applyOpts);
+        applyCurrentInfo(info);
     } catch (error) {
         // Issue #16: a thrown error (e.g. messaging/network blip) is transient, so we
         // do NOT negative-cache it — the user is retried on a later scan rather than
         // being blanked for the session.
+        applyCurrentInfo(null);
+        retryAt = retryDeadline(null);
+        if (isCurrentElement()) deferElementRetry(element, screenName, retryAt);
         if (debug) debug(`Processing error for @${screenName}: ${error?.message || error}`);
     } finally {
+        if (shimmer) shimmer.remove();
         clearTimeout(processingTimeout);
-        processingQueue.delete(screenName);
-        resolveProcessing(); // Signal completion to waiting requests
+        if (processingQueue.get(screenName) === processingPromise) processingQueue.delete(screenName);
+        resolveProcessing({ retryAt }); // Waiting rows inherit the same retry deadline.
     }
 }
 
 // ============================================
 // BLOCKED TWEETS UPDATE
 // ============================================
+
+function applyAvailableFilters(element, screenName, filters) {
+    const tweet = element.closest(SELECTORS.TWEET);
+    const isUserCell = element.matches(SELECTORS.USER_CELL);
+    element.dataset.xScreenName = screenName;
+    applyLanguageBlock(tweet, filters.blockedLanguages, filters.settings, filters.allowedUsers);
+    applyInfoToElement(element, screenName, userInfoCache.get(screenName) || null, {
+        ...filters, tweet, isUserCell,
+        tagBlocked: filters.blockedTags?.size > 0 &&
+            hasBlockedTag(extractDisplayName(element), filters.blockedTags)
+    });
+}
+
+/**
+ * Release rendered rows for a settings rescan, including collapsed quotes whose
+ * children otherwise never intersect the viewport. Invalidate outstanding applies
+ * at the same time so replies from the previous settings cannot restore old state.
+ * Explicitly revealed quotes remain revealed until their element is recycled.
+ */
+export function resetProcessedElements(filters) {
+    const retryRows = Array.from(document.querySelectorAll('[data-x-retry-after]'));
+    document.querySelectorAll(`.${CSS_CLASSES.INFO_BADGE}`).forEach(el => el.remove());
+    document.querySelectorAll('[data-x-processed], [data-x-screen-name]').forEach(el => {
+        elementProcessingTokens.delete(el);
+        delete el.dataset.xProcessed;
+        delete el.dataset.xScreenName;
+    });
+    document.querySelectorAll('.x-tweet-blocked, .x-tweet-vpn-blocked, .x-tweet-highlighted')
+        .forEach(el => el.classList.remove('x-tweet-blocked', 'x-tweet-vpn-blocked', 'x-tweet-highlighted'));
+    document.querySelectorAll('[data-x-block]').forEach(el => { delete el.dataset.xBlock; });
+    document.querySelectorAll('[data-x-lang-block]').forEach(el => { delete el.dataset.xLangBlock; });
+    document.querySelectorAll('[data-x-quote-block], [data-x-quote-reason]').forEach(el => {
+        if (el.dataset.xQuoteBlock !== 'shown') delete el.dataset.xQuoteBlock;
+        delete el.dataset.xQuoteReason;
+    });
+
+    // Waiting rows skip the visibility queue, but their already-known filters
+    // must still reflect settings changes. This pass performs no lookup.
+    if (filters) {
+        for (const element of retryRows) {
+            const isUserCell = element.matches(SELECTORS.USER_CELL);
+            const screenName = isUserCell ? extractUsernameFromUserCell(element) : extractUsername(element);
+            if (!screenName || !isRetryDeferred(element, screenName)) continue;
+            applyAvailableFilters(element, screenName, filters);
+        }
+    }
+}
 
 // Coalesce rapid BLOCKED_COUNTRIES/REGIONS/TAGS updates into a single rAF pass.
 // Each trigger fires updateBlockedTweets separately; without batching that means
@@ -1189,6 +1444,8 @@ let pendingBlockedTweetsArgs = null;
  */
 export function updateBlockedTweets(filters) {
     pendingBlockedTweetsArgs = filters || {};
+    latestFilterSnapshot = pendingBlockedTweetsArgs;
+    filterRevision++;
     if (pendingBlockedTweetsUpdate !== null) return;
 
     pendingBlockedTweetsUpdate = requestAnimationFrame(() => {
@@ -1249,13 +1506,15 @@ function runUpdateBlockedTweets({
 
         // Who-they-are filters apply to quoted authors too; applyBlockState routes a
         // quoted verdict to the card-only marker instead of the row (issue #32).
-        const matchesBlockList =
-            (isBlockedCountry || isBlockedRegion || isTagBlocked || isAffiliationBlocked ||
-                isBioBlocked || isLabelBlocked) && !isExempt;
+        const blockReason = resolveBlockReason({
+            isExempt, isBlockedCountry, isBlockedRegion, isTagBlocked,
+            isBioBlocked, isLabelBlocked, isAffiliationBlocked
+        });
+        const matchesBlockList = blockReason !== '';
 
-        // VPN-hide is a setting, not a blocked-list entry, so it isn't what changed here —
-        // but we must still honor it, or a blocked-list edit would wrongly un-hide a VPN
-        // row in highlight mode. locationAccurate lives on the cached info, keyed by name.
+        // Location uncertainty is a setting, not a blocked-list entry, but a list edit
+        // must retain its verdict. The presentation follows hide/highlight mode too.
+        // locationAccurate lives on the cached info, keyed by name.
         // Never for a quoted author: that would hide the quoting user's own post.
         const info = screenName ? userInfoCache.get(screenName) : null;
         const isVpnHidden = !isQuote && !!info && info.locationAccurate === false &&
@@ -1266,7 +1525,8 @@ function runUpdateBlockedTweets({
             isVpnHidden,
             highlightMode,
             isQuote,
-            neverHide: isUserCell
+            neverHide: isUserCell,
+            reason: blockReason
         });
 
         const badge = element.querySelector(`.${CSS_CLASSES.INFO_BADGE}`);
@@ -1329,6 +1589,82 @@ export function setupQuoteReveal() {
 // SPA NAVIGATION (issue #40)
 // ============================================
 
+function releaseElementMarkers(element, currentScreenName) {
+    element.querySelector(`.${CSS_CLASSES.INFO_BADGE}`)?.remove();
+    elementProcessingTokens.delete(element);
+    elementTweetContexts.delete(element);
+    elementQuoteContexts.delete(element);
+    delete element.dataset.xProcessed;
+    delete element.dataset.xScreenName;
+    delete element.dataset.xCountry;
+    delete element.dataset.xBlock;
+    delete element.dataset.xQuoteBlock;
+    delete element.dataset.xQuoteReason;
+    if (isValidScreenName(currentScreenName)) element.dataset.xScreenName = currentScreenName;
+}
+
+/**
+ * Re-derive post presentation after route or timestamp changes. A newly opened
+ * focal post can have been hidden before its identity was known, so its main
+ * author must bypass the visibility queue once to recover the badge/lookup.
+ * Unknown identity never receives that exception; quoted authors remain lazy.
+ */
+export function refreshPostContext(filters, processElementSafe) {
+    if (!filters) return;
+    const focalElements = [];
+    for (const tweet of document.querySelectorAll(SELECTORS.TWEET)) {
+        const previous = postContexts.get(tweet);
+        const id = ownPostId(tweet);
+        const current = {
+            id,
+            focal: isFocalTweet(tweet),
+            lastKnownId: id || previous?.lastKnownId || null
+        };
+        postContexts.set(tweet, current);
+        const changed = !previous || previous.id !== current.id || previous.focal !== current.focal;
+        if (previous?.lastKnownId && current.id && previous.lastKnownId !== current.id) {
+            // A reveal belongs to the quoted post in this outer post, not to a
+            // recycled article. Route-only changes keep the explicit reveal.
+            for (const element of tweet.querySelectorAll('[data-x-quote-block]')) {
+                delete element.dataset.xQuoteBlock;
+                delete element.dataset.xQuoteReason;
+            }
+        }
+
+        // A username can move to a different article without taking the old
+        // article's classes with it. Rebuild those classes from current authors.
+        tweet.classList.remove(CSS_CLASSES.TWEET_BLOCKED, 'x-tweet-vpn-blocked', 'x-tweet-highlighted');
+        if (!current.focal) continue;
+        for (const element of tweet.querySelectorAll(SELECTORS.USERNAME)) {
+            if (element.closest(SELECTORS.TWEET) !== tweet || isInsideQuoteTweet(element, tweet)) continue;
+            if (!element.dataset.xProcessed ||
+                (changed && !element.querySelector(`.${CSS_CLASSES.INFO_BADGE}`))) {
+                focalElements.push(element);
+            }
+        }
+    }
+
+    latestFilterSnapshot = filters;
+    filterRevision++;
+    // Moving a deferred account must not bypass its already-known name/bio/label
+    // filters. Restore that state locally while keeping the network deadline.
+    for (const element of document.querySelectorAll('[data-x-retry-after]')) {
+        const screenName = element.matches(SELECTORS.USER_CELL)
+            ? extractUsernameFromUserCell(element) : extractUsername(element);
+        if (isValidScreenName(screenName) && isRetryDeferred(element, screenName)) {
+            applyAvailableFilters(element, screenName, filters);
+        }
+    }
+    runUpdateBlockedTweets(filters);
+    for (const element of focalElements) {
+        elementProcessingTokens.delete(element);
+        delete element.dataset.xProcessed;
+        intersectionObserver?.unobserve(element);
+        pendingVisibility.delete(element);
+        processElementSafe(element);
+    }
+}
+
 /**
  * Drop our markers from elements X has recycled for a DIFFERENT account.
  *
@@ -1355,17 +1691,11 @@ export function releaseRecycledElements(debug) {
             ? extractUsernameFromUserCell(element)
             : extractUsername(element);
 
-        // Unreadable mid-render, or still the same account — leave it alone. A later
-        // pass in this navigation's settle window retries.
-        if (!current || current === element.dataset.xScreenName) return;
+        const moved = hasChangedElementContext(element);
+        // An unchanged handle does not imply an unchanged article.
+        if (!current || (current === element.dataset.xScreenName && !moved)) return;
 
-        const badge = element.querySelector(`.${CSS_CLASSES.INFO_BADGE}`);
-        if (badge) badge.remove();
-        delete element.dataset.xProcessed;
-        delete element.dataset.xScreenName;
-        delete element.dataset.xCountry;
-        delete element.dataset.xBlock;
-        delete element.dataset.xQuoteBlock;
+        releaseElementMarkers(element, current);
         released++;
     });
 
@@ -1396,6 +1726,7 @@ function checkForNavigation(onNavigate) {
     if (typeof location === 'undefined' || location.pathname === lastPath) return;
     lastPath = location.pathname;
 
+    onNavigate();
     for (const id of navTimeouts) clearTimeout(id);
     navTimeouts = NAV_SETTLE_DELAYS_MS.map(delay => setTimeout(onNavigate, delay));
 }
@@ -1442,6 +1773,11 @@ export function cleanupObservers() {
     }
 
     // Clear all processing queues properly
+    elementProcessingTokens = new WeakMap();
+    elementTweetContexts = new WeakMap();
+    elementQuoteContexts = new WeakMap();
+    postContexts = new WeakMap();
+    latestFilterSnapshot = null;
     processingQueue.clear();
     userInfoCache.clear();
     pendingVisibility.clear();

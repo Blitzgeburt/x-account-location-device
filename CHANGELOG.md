@@ -2,6 +2,34 @@
 
 All notable changes to X-Posed will be documented in this file.
 
+## [3.6.0] - 2026-09-12
+
+### New
+- **See why a quoted post was hidden** ([#42](https://github.com/xaitax/x-account-location-device/issues/42), requested by **@BrotherSinz**): the collapsed placeholder now names the filter that caught it — Country, Region, Name tag, Bio tag, Account type or Affiliation — so you can tell which list to look at without revealing the post first. Only applies when blocked posts are hidden; with **Highlight blocked tweets** on, the quote card stays readable and is flagged in amber as before.
+- **Always Show from the account card** ([#47](https://github.com/xaitax/x-account-location-device/issues/47)): add or remove the displayed account directly. The action waits for a successful save, reports errors with a retry, and cannot accidentally act on a different account when the card changes.
+- **Optional government / multilateral filter** ([#48](https://github.com/xaitax/x-account-location-device/issues/48)): select **Government / multilateral — grey checkmark** under **Blocking → Tags → Account label**, in Settings or the sidebar. Off by default. Matches the author's rendered grey checkmark, including quoted authors, without additional lookups or inference from names, biographies or generic verification. Uses the usual highlight, Always Show and opened-post rules; badge changes are rechecked locally. Unknown or unbadged accounts are not classified.
+- **Opened posts remain readable** ([PR #55](https://github.com/xaitax/x-account-location-device/pull/55), adapted): a main post identified by its own timestamp permalink is highlighted instead of hidden. Replies and quoted authors retain their normal filtering. Navigation, delayed timestamps and recycled articles are rechecked; a missing identity is never guessed from tabindex.
+
+### Bug Fixes
+- **Quoted name and bio filters** ([#57](https://github.com/xaitax/x-account-location-device/issues/57)): quoted authors use their own names and profile details, including X's linkless quoted-name markup. A handle-like display name cannot substitute the current page's author for the quoted account, and incomplete headers do not treat a handle or timestamp as a name. Available name, bio and account-label filters work even when account-location data is missing or its lookup fails.
+- **Emoji name tags with empty image alt text**: recognize X emoji SVG filenames when X leaves the alt attribute blank; arbitrary images and image titles are not treated as emoji text.
+- **Highlight mode keeps location-warning accounts visible** ([#50](https://github.com/xaitax/x-account-location-device/issues/50)): the former VPN/proxy-user toggle now follows the same hide/highlight mode as other filters. Its wording explains that X's location warning is not proof of VPN use.
+- **Late lookups cannot restore outdated filters or the wrong author**: results are checked against the current row and latest country/tag/allowlist settings. Clearing a filter while a lookup is pending stays effective.
+- **Quote visibility updates correctly when settings change**, including previously collapsed quotes; an explicitly revealed quote remains revealed until X recycles it.
+- **Country aliases and territory coverage** ([#45](https://github.com/xaitax/x-account-location-device/issues/45), [#49](https://github.com/xaitax/x-account-location-device/issues/49), [#53](https://github.com/xaitax/x-account-location-device/issues/53), [#54](https://github.com/xaitax/x-account-location-device/issues/54)): Côte d'Ivoire, Syrian Arab Republic, Lao People's Democratic Republic and Bonaire now resolve consistently in flags, filtering and device-source countries. Accent/apostrophe variants and previously saved aliases normalize to the same selection.
+- **Added Asia, Central Asia and Oceania** ([#46](https://github.com/xaitax/x-account-location-device/issues/46)). Region controls now explicitly describe matching X's regional labels, without implicitly selecting countries.
+- **Cache expiry is enforced throughout a session**. Community records retain their source timestamp and remaining lifetime; expired records and recirculated cloud contributions are skipped.
+- **List-save failures are reported accurately**: blocked lists and Always Show change in memory only after storage succeeds, and concurrent edits cannot overwrite one another through a failed save.
+
+### Request Reliability
+- Background rate-limit deadlines survive worker restarts and respect valid reset/Retry-After headers. Concurrent responses cannot shorten an existing cooldown.
+- Page-session fallback lookups are paced and deduplicated, respect 429 cooldowns, and have a deadline covering queueing and the response body. Timeouts release their queue slots.
+- Transient failures remain eligible for a later ordinary page scan after backoff; they no longer become permanent page-session misses. No new polling or autonomous retry loop is added.
+- These safeguards do **not** establish the cause of the account restriction reported in [#52](https://github.com/xaitax/x-account-location-device/issues/52), which remains unresolved.
+
+### Compatibility
+- Existing local records with unknown source age keep their original expiry. Old backup cache entries without source timestamps are skipped on import; settings and filter lists still import.
+
 ## [3.5.0] - 2026-08-04
 
 ### New

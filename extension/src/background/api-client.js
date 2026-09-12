@@ -5,6 +5,8 @@
 
 import { API_CONFIG, BEARER_TOKEN } from '../shared/constants.js';
 import { sleep } from '../shared/utils.js';
+import browserAPI from '../shared/browser-api.js';
+import { RATE_LIMIT_STORAGE_KEY, readRateLimitReset, withLookupTimeout } from '../shared/request-policy.js';
 
 /**
  * API Error with typed error codes
@@ -24,6 +26,7 @@ export const API_ERROR_CODES = {
     NO_HEADERS: 'NO_HEADERS',
     RATE_LIMITED: 'RATE_LIMITED',
     NETWORK_ERROR: 'NETWORK_ERROR',
+    TIMEOUT: 'TIMEOUT',
     PARSE_ERROR: 'PARSE_ERROR',
     NOT_FOUND: 'NOT_FOUND',
     UNAUTHORIZED: 'UNAUTHORIZED',
@@ -52,6 +55,9 @@ class RequestQueue {
     }
 
     async add(request) {
+        if (this.rateLimitReset > Date.now()) {
+            throw new APIError('Rate limit exceeded', API_ERROR_CODES.RATE_LIMITED, 429, this.rateLimitReset);
+        }
         return new Promise((resolve, reject) => {
             this.queue.push({ request, resolve, reject });
             this.process();
@@ -71,7 +77,8 @@ class RequestQueue {
 
         // Global rate-limit cooldown.
         if (this.rateLimitReset > now) {
-            this.scheduleProcess(Math.min(this.rateLimitReset - now, 60000));
+            const error = new APIError('Rate limit exceeded', API_ERROR_CODES.RATE_LIMITED, 429, this.rateLimitReset);
+            for (const item of this.queue.splice(0)) item.reject(error);
             return;
         }
 
@@ -99,7 +106,7 @@ class RequestQueue {
             item.resolve(result);
         } catch (error) {
             if (error instanceof APIError && error.code === API_ERROR_CODES.RATE_LIMITED) {
-                this.rateLimitReset = error.retryAfter || (Date.now() + 60000);
+                this.setRateLimit(error.retryAfter || (Date.now() + 60000));
             }
             item.reject(error);
         } finally {
@@ -121,7 +128,7 @@ class RequestQueue {
     }
 
     setRateLimit(resetTime) {
-        this.rateLimitReset = resetTime;
+        if (Number.isFinite(resetTime)) this.rateLimitReset = Math.max(this.rateLimitReset, resetTime);
     }
 
     get pendingCount() {
@@ -203,10 +210,17 @@ class RequestDeduplicator {
  * X API Client
  */
 export class XAPIClient {
-    constructor() {
+    constructor(storage = browserAPI.storage.local) {
         this.headers = null;
         this.queue = new RequestQueue();
         this.deduplicator = new RequestDeduplicator();
+        this.storage = storage;
+        this.rateLimitSave = Promise.resolve();
+        // MV3 workers are disposable: a restart must not forget X's reset deadline.
+        this.rateLimitReady = this.storage.get(RATE_LIMIT_STORAGE_KEY).then(result => {
+            const reset = result[RATE_LIMIT_STORAGE_KEY];
+            if (Number.isFinite(reset) && reset > Date.now()) this.queue.setRateLimit(reset);
+        }).catch(() => {});
     }
 
     /**
@@ -259,6 +273,7 @@ export class XAPIClient {
      * Fetch user info from X API
      */
     async fetchUserInfo(screenName, csrfToken = null) {
+        await this.rateLimitReady;
         // Use deduplicator to prevent duplicate requests
         return this.deduplicator.dedupe(screenName, async () => {
             return this.queue.add(async () => {
@@ -271,6 +286,10 @@ export class XAPIClient {
      * Execute the actual API request with retry logic for transient failures
      */
     async executeRequest(screenName, csrfToken = null, retryCount = 0) {
+        // A different in-flight lookup may have received a 429 while this retry slept.
+        if (this.queue.rateLimitReset > Date.now()) {
+            throw new APIError('Rate limit exceeded', API_ERROR_CODES.RATE_LIMITED, 429, this.queue.rateLimitReset);
+        }
         let headers = this.getHeaders();
 
         // Try fallback headers if no captured headers
@@ -296,22 +315,19 @@ export class XAPIClient {
         requestHeaders['accept-language'] = 'en-US,en;q=0.9';
 
         try {
-            const response = await fetch(url, {
-                headers: requestHeaders,
-                method: 'GET',
-                mode: 'cors',
-                credentials: 'include'
+            return await withLookupTimeout(async signal => {
+                const response = await fetch(url, {
+                    headers: requestHeaders,
+                    method: 'GET',
+                    mode: 'cors',
+                    credentials: 'include',
+                    signal
+                });
+                if (!response.ok) await this.handleErrorResponse(response);
+                return this.parseResponse(await response.json(), screenName);
             });
-
-            if (!response.ok) {
-                await this.handleErrorResponse(response);
-                // handleErrorResponse always throws, so this line won't be reached
-                return null;
-            }
-
-            const data = await response.json();
-            return this.parseResponse(data, screenName);
         } catch (error) {
+            if (error.code === API_ERROR_CODES.TIMEOUT) throw error;
             if (error instanceof APIError) {
                 // Don't retry rate limits, auth errors, or not found
                 if (error.code === API_ERROR_CODES.RATE_LIMITED ||
@@ -346,8 +362,13 @@ export class XAPIClient {
      */
     async handleErrorResponse(response) {
         if (response.status === 429) {
-            const reset = response.headers.get('x-rate-limit-reset');
-            const retryAfter = reset ? parseInt(reset) * 1000 : Date.now() + 60000;
+            const retryAfter = readRateLimitReset(response.headers);
+            this.queue.setRateLimit(retryAfter);
+            // Set memory first; storage failure must never turn a 429 into a retry.
+            this.rateLimitSave = this.rateLimitSave.then(() =>
+                this.storage.set({ [RATE_LIMIT_STORAGE_KEY]: this.queue.rateLimitReset })
+            ).catch(() => {});
+            await this.rateLimitSave;
             const waitMinutes = Math.ceil((retryAfter - Date.now()) / 60000);
             
             console.warn(`⚠️ Rate limited. Retry in ${waitMinutes} minute(s)`);
@@ -356,7 +377,7 @@ export class XAPIClient {
                 'Rate limit exceeded',
                 API_ERROR_CODES.RATE_LIMITED,
                 429,
-                retryAfter
+                this.queue.rateLimitReset
             );
         }
 

@@ -55,11 +55,13 @@ export const CLOUD_CACHE_CONFIG = {
     RETRY_DELAY_MS: 2000,
 
     // Rate limiting (client-side)
-    MAX_REQUESTS_PER_MINUTE: 30,
-
-    // Feature flags
-    ENABLED_BY_DEFAULT: false    // Opt-in only
+    MAX_REQUESTS_PER_MINUTE: 30
 };
+// NOTE: there is deliberately no ENABLED_BY_DEFAULT here. Since v3.0.0 the cache is
+// turned on for NEW installs only, by handleInstalled() in background/service-worker.js,
+// and the live state is read straight from STORAGE_KEYS.CLOUD_CACHE_ENABLED. A constant
+// mirroring that would be a second source of truth that nothing reads and everything
+// misquotes — the old one claimed "opt-in only" long after it had stopped being true.
 
 // Z-index layering (ensures consistent stacking order)
 export const Z_INDEX = {
@@ -94,7 +96,7 @@ export const TIMING = {
 // PERFORMANCE: Optimized save intervals
 export const CACHE_CONFIG = {
     EXPIRY_MS: 60 * 24 * 60 * 60 * 1000, // 60 days (location data rarely changes)
-    MAX_ENTRIES: 50000, // LRU cache limit (~135 bytes persisted per entry, see toPersistedValue)
+    MAX_ENTRIES: 50000, // LRU cache limit; compact records include source timestamp/provenance
     SAVE_INTERVAL_MS: 60000 // Increased from 30s to reduce I/O overhead
 };
 
@@ -210,7 +212,10 @@ export const DEFAULT_SETTINGS = {
     // counts) instead of requesting it. Costs no extra API calls and never leaves the device.
     // Exposed as a kill switch because X can change these response shapes without notice.
     profileEnrichment: true,
-    cloudCacheEnabled: false,  // Opt-in only
+    // NOTE: the community cache is NOT a setting here. It lives in its own storage key
+    // (STORAGE_KEYS.CLOUD_CACHE_ENABLED) because the background reads it before settings
+    // load. A `cloudCacheEnabled: false` used to sit here, read by nothing, riding along
+    // in every settings export saying "false" even for users who had the cache on.
     highlightBlockedTweets: false  // If true, highlight instead of hide blocked tweets
 };
 
@@ -268,6 +273,7 @@ export const COUNTRY_FLAGS = {
     // location in their own right, so without them the badge showed no flag and the
     // country could not be blocked at all (reported for Réunion, Jersey, Gibraltar).
     'aland islands': '🇦🇽', 'american samoa': '🇦🇸', 'anguilla': '🇦🇮', 'aruba': '🇦🇼', 'bermuda': '🇧🇲',
+    'bonaire': '🇧🇶', // ISO BQ: Bonaire, Sint Eustatius and Saba (issue #53).
     'british virgin islands': '🇻🇬', 'cayman islands': '🇰🇾', 'christmas island': '🇨🇽', 'cook islands': '🇨🇰', 'curaçao': '🇨🇼',
     'curacao': '🇨🇼', 'falkland islands': '🇫🇰', 'faroe islands': '🇫🇴', 'french guiana': '🇬🇫', 'french polynesia': '🇵🇫',
     'gibraltar': '🇬🇮', 'greenland': '🇬🇱', 'guadeloupe': '🇬🇵', 'guam': '🇬🇺', 'guernsey': '🇬🇬',
@@ -285,17 +291,22 @@ export const COUNTRY_FLAGS = {
  * (and the same for the UK/US/UAE aliases). Keys and values are lowercase.
  */
 export const COUNTRY_ALIASES = {
+    'bonaire, sint eustatius and saba': 'bonaire',
     'bosnia': 'bosnia and herzegovina',
     'britain': 'united kingdom',
     'burma': 'myanmar',
+    "cote d'ivoire": 'ivory coast',
+    'curacao': 'curaçao',
     'czechia': 'czech republic',
     'east timor': 'timor-leste',
     'great britain': 'united kingdom',
     'korea': 'south korea',
+    "lao people's democratic republic": 'laos',
     'macau': 'macao',
     'macedonia': 'north macedonia',
     'reunion': 'réunion',
     'russian federation': 'russia',
+    'syrian arab republic': 'syria',
     'türkiye': 'turkey',
     'uae': 'united arab emirates',
     'uk': 'united kingdom',
@@ -304,13 +315,6 @@ export const COUNTRY_ALIASES = {
     'viet nam': 'vietnam'
 };
 
-/**
- * Fold a location X reported onto the canonical lowercase country name used by the
- * blocked-country set and the UI. Unknown names pass through lowercased, so regions
- * and countries we don't know are unaffected.
- * @param {string|null|undefined} name
- * @returns {string} canonical lowercase name, or '' when there is nothing to resolve
- */
 /**
  * Was this record actually inspected for an affiliation?
  *
@@ -333,18 +337,41 @@ export function affiliationWasChecked(meta) {
     return meta.affiliateUsername !== undefined || !!meta.affiliate;
 }
 
+// Normalize spelling only for lookups. Canonical names retain their existing accents
+// so stored selections such as "réunion" remain compatible. X uses both straight and
+// typographic apostrophes in names such as Côte d'Ivoire and Lao People's Democratic
+// Republic; decomposed accents must resolve to the same selection too (#45, #54).
+function countryLookupKey(name) {
+    return name.normalize('NFKD')
+        .replace(/\p{M}/gu, '')
+        .replace(/[\u2018\u2019\u02bc]/g, "'");
+}
+
+const COUNTRY_NAME_LOOKUP = new Map(
+    Object.keys(COUNTRY_FLAGS).map(name => [countryLookupKey(name), name])
+);
+for (const [alias, canonical] of Object.entries(COUNTRY_ALIASES)) {
+    COUNTRY_NAME_LOOKUP.set(countryLookupKey(alias), canonical);
+}
+
+/**
+ * Resolve X's location spelling to the lowercase country name used by the picker
+ * and stored filters. Unknown names retain their spelling apart from case and
+ * whitespace. This never infers a region or expands one into member countries.
+ * @param {string|null|undefined} name
+ * @returns {string} canonical lowercase name, or '' when there is nothing to resolve
+ */
 export function canonicalCountry(name) {
     if (!name || typeof name !== 'string') return '';
-    const key = name.trim().toLowerCase();
+    const key = name.trim().toLowerCase().replace(/\s+/g, ' ');
     if (key === '') return '';
-    return Object.hasOwn(COUNTRY_ALIASES, key) ? COUNTRY_ALIASES[key] : key;
+    return COUNTRY_NAME_LOOKUP.get(countryLookupKey(key)) || key;
 }
 
 // Get sorted country list for UI
-export const COUNTRY_LIST = Object.keys(COUNTRY_FLAGS)
+export const COUNTRY_LIST = [...new Set(Object.keys(COUNTRY_FLAGS).map(canonicalCountry))]
     // Show each country once, under the canonical name. Derived from COUNTRY_ALIASES so
     // the picker and the block comparison can never disagree about which name wins.
-    .filter(name => !Object.hasOwn(COUNTRY_ALIASES, name))
     .sort();
 
 // Region display names (for UI) with geographic globe emojis
@@ -353,14 +380,17 @@ export const COUNTRY_LIST = Object.keys(COUNTRY_FLAGS)
 // 🌏 = Asia, Oceania (Asia/Australia visible)
 export const REGION_DATA = [
     { name: 'Africa', key: 'africa', flag: '🌍' },
+    { name: 'Asia', key: 'asia', flag: '🌏' },
     { name: 'Australasia', key: 'australasia', flag: '🌏' },
     { name: 'Caribbean', key: 'caribbean', flag: '🌎' },
+    { name: 'Central Asia', key: 'central asia', flag: '🌏' },
     { name: 'East Asia', key: 'east asia', flag: '🌏' },
     { name: 'East Asia & Pacific', key: 'east asia & pacific', flag: '🌏' },
     { name: 'Eastern Europe (Non-EU)', key: 'eastern europe (non-eu)', flag: '🌍' },
     { name: 'Europe', key: 'europe', flag: '🌍' },
     { name: 'North Africa', key: 'north africa', flag: '🌍' },
     { name: 'North America', key: 'north america', flag: '🌎' },
+    { name: 'Oceania', key: 'oceania', flag: '🌏' },
     { name: 'South America', key: 'south america', flag: '🌎' },
     { name: 'South Asia', key: 'south asia', flag: '🌏' },
     { name: 'Southeast Asia', key: 'southeast asia', flag: '🌏' },
@@ -386,8 +416,7 @@ export const REGION_LIST = REGION_DATA;
  * @returns {boolean} - True if location is a region
  */
 export function isRegion(location) {
-    if (!location) return false;
-    return Object.hasOwn(REGION_FLAGS, location.toLowerCase());
+    return Object.hasOwn(REGION_FLAGS, canonicalCountry(location));
 }
 
 /**
@@ -404,6 +433,14 @@ export const PCF_LABELS = [
 ];
 
 export const PCF_LABEL_NAMES = Object.fromEntries(PCF_LABELS.map(l => [l.value, l.name]));
+
+// Account-label filtering also supports X's rendered grey verification badge. Keep
+// this separate from the PCF enum: a government badge is not an authenticity label.
+export const GOVERNMENT_LABEL = 'government';
+export const ACCOUNT_LABELS = [
+    ...PCF_LABELS,
+    { value: GOVERNMENT_LABEL, name: 'Government / multilateral — grey checkmark' }
+];
 
 /**
  * Normalise X's raw label to our stored value, or '' when the account has none.
@@ -497,4 +534,3 @@ export const LANGUAGE_LIST = [...LANGUAGE_DATA].sort((a, b) => a.name.localeComp
 export const LANGUAGE_NAMES = Object.fromEntries(
     LANGUAGE_DATA.map(l => [l.code, l.name])
 );
-

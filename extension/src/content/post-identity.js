@@ -1,0 +1,83 @@
+/**
+ * Identify the deliberately opened post from its own timestamp permalink. X's
+ * article tabindex and links in post/quote text do not establish that identity.
+ */
+
+const X_HOSTS = new Set([
+    'x.com', 'www.x.com', 'mobile.x.com',
+    'twitter.com', 'www.twitter.com', 'mobile.twitter.com'
+]);
+const STATUS_PATH = /^\/(?:[a-zA-Z0-9_]{1,15}\/status|i\/web\/status)\/([1-9]\d*)(?:\/(?:photo|video)\/[1-9]\d*)?\/?$/;
+
+/**
+ * Read an exact post ID without losing precision. Only post and media routes
+ * count; analytics, quote listings, and other post subpages do not.
+ * @param {string} pathOrUrl
+ * @returns {string|null}
+ */
+export function statusIdOf(pathOrUrl) {
+    if (typeof pathOrUrl !== 'string' || !pathOrUrl || pathOrUrl.includes('\\')) return null;
+    if (!pathOrUrl.startsWith('/') && !/^https?:\/\//i.test(pathOrUrl)) return null;
+
+    try {
+        const url = new URL(pathOrUrl, 'https://x.com');
+        if (!['http:', 'https:'].includes(url.protocol) || !X_HOSTS.has(url.hostname) ||
+            url.username || url.password || url.port) return null;
+        return STATUS_PATH.exec(url.pathname)?.[1] || null;
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * @param {HTMLElement} time
+ * @param {HTMLAnchorElement} link
+ * @param {HTMLElement} article
+ * @returns {boolean}
+ */
+function isOwnTimestamp(time, link, article) {
+    if (link.closest('article') !== article) return false;
+    // An anchor wrapping an entire quote card is not its timestamp permalink.
+    if (link.querySelector('[data-testid="User-Name"], [data-testid="tweetText"]')) return false;
+
+    let node = time.parentElement;
+    while (node && node !== article) {
+        if (node.matches('article, [data-testid="tweetText"], [data-testid="quoteTweet"]')) return false;
+        // The timestamp itself may be focusable; its containing quote card is
+        // the boundary. This matches the card structure supplied from X.
+        if (node !== link && node.matches('[role="link"][tabindex="0"]')) return false;
+        node = node.parentElement;
+    }
+    return node === article;
+}
+
+/**
+ * Resolve only unambiguous timestamps belonging to this article. In particular,
+ * a quote's time can precede the main post's footer timestamp in document order.
+ * @param {HTMLElement|null} article
+ * @returns {string|null}
+ */
+export function ownPostId(article) {
+    if (!article?.matches('article[data-testid="tweet"]')) return null;
+    let ownId = null;
+    for (const time of article.querySelectorAll('time')) {
+        const link = time.closest('a[href]');
+        if (!link || !isOwnTimestamp(time, link, article)) continue;
+        const id = statusIdOf(link.getAttribute('href'));
+        if (!id) continue;
+        if (ownId && ownId !== id) return null;
+        ownId = id;
+    }
+    return ownId;
+}
+
+/**
+ * Unknown identity cannot exempt a post from filtering.
+ * @param {HTMLElement|null} article
+ * @param {string} [pathname]
+ * @returns {boolean}
+ */
+export function isFocalTweet(article, pathname = globalThis.location?.pathname) {
+    const focalId = statusIdOf(pathname);
+    return focalId !== null && ownPostId(article) === focalId;
+}

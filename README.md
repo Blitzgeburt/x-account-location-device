@@ -16,10 +16,10 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-3.5.0-20c8e5?style=flat-square" alt="Version 3.5.0">
+  <img src="https://img.shields.io/badge/version-3.6.0-20c8e5?style=flat-square" alt="Version 3.6.0">
   <img src="https://img.shields.io/badge/Chrome_users-5%2C000%2B-20c8e5?style=flat-square" alt="More than 5,000 Chrome users">
   <img src="https://img.shields.io/badge/Firefox_users-about_500-20c8e5?style=flat-square" alt="About 500 Firefox users">
-  <img src="https://img.shields.io/badge/community_cache-3.3M%2B-20c8e5?style=flat-square" alt="More than 3.3 million community cache entries">
+  <img src="https://img.shields.io/badge/community_cache-4M%2B-20c8e5?style=flat-square" alt="More than 4 million community cache entries">
   <a href="https://spdx.org/licenses/MIT.html"><img src="https://img.shields.io/badge/license-MIT-7f8c93?style=flat-square" alt="MIT License"></a>
 </p>
 
@@ -121,21 +121,28 @@ Filters are available in Options and through the optional **Blocking** link in X
 | Country | X's account country, or the source country when Flag from Device is enabled |
 | Region | An exact regional label returned by X, such as Europe or South Asia |
 | Display-name tag | Case-insensitive text in the display name |
+| Bio tag | Case-insensitive text in the available profile biography |
+| Account label | X's Parody / Commentary / Fan label, or the author's rendered grey checkmark |
 | Language | The post's `lang` value supplied by X |
 | Affiliation | The organisation name or affiliated username returned by X |
 | VPN/proxy warning | `location_accurate: false` |
 
 - **Hide mode** removes matching posts.
 - **Highlight mode** keeps matching posts visible with an amber marker.
+- Highlight mode also applies when **Show Accounts with Location Warnings** is off.
+- On a single-post page, the main post stays readable and is highlighted when it matches a filter; replies and quoted authors keep their normal rules. This requires its own timestamp permalink to identify it reliably.
 - **Always-Show Accounts** exempts selected handles from every filter.
 - The first-run Always-Show list contains `@xaitax`. It is not added again after removal.
-- A matching author inside a quoted post collapses only the quote card for country, region, tag, language, and affiliation filters.
+- A matching author inside a quoted post collapses only the quote card for country, region, name/bio tag, account-type, and affiliation filters.
+- Language filtering uses the enclosing post's language, not the quoted text's language.
 - VPN filtering applies only to a post's own author, not the author inside its quote.
 - Matching accounts in Followers, Following, search results, and other people lists are highlighted but never removed.
 - The language value `und` is never blocked.
 - Changing a filter rechecks posts already on the page.
 
 Older community-cache records may not contain affiliation data. Opening the account card performs the full lookup and can add that data to future cache records. Enabling the affiliation filter does not make extra X requests for every timeline account.
+
+New in 3.6.0: **Blocking → Tags → Account label → Government / multilateral — grey checkmark** is available in both Settings and the sidebar, off by default. It matches the author's own rendered [X grey checkmark](https://help.x.com/en/using-x/grey-checkmark), even with profile enrichment off, without extra requests. It does not infer government status from names, biographies, blue/gold verification, or an affiliation badge. Unknown badge variants and unbadged accounts remain unclassified.
 
 ### Share evidence
 
@@ -232,7 +239,9 @@ X frequently replaces and reuses page elements while scrolling. X-Posed keeps fi
 | Local extension cache | Up to 50,000 entries for 60 days | Keep common account data across restarts |
 | Community cache | 60-day Worker KV lifetime | Reuse public account data between users |
 
-The local cache stores location, source, accuracy, and affiliation state. Names, avatars, verification details, and most other card fields normally stay in memory. If extension storage reaches its quota, X-Posed removes the oldest quarter of the cache and retries.
+The local cache stores location, source, accuracy, affiliation state, and the source record's timestamp and community-cache provenance. Expiry is enforced during the session as well as on startup. Downloading a community record preserves its remaining lifetime. Older local records keep their existing expiry with an explicitly unknown source age; importing an old cache backup without timestamps skips those cache entries while still importing its settings and lists. Names, avatars, verification details, and most other card fields normally stay in memory. If extension storage reaches its quota, X-Posed removes the oldest quarter of the cache and retries.
+
+X rate-limit deadlines are retained across background-worker restarts. Page-session fallback lookups are paced, deduplicated, and stop during a server cooldown; their total deadline includes waiting for a slot and reading the response body. These controls do not establish why X restricted any account or guarantee protection from enforcement.
 
 The profile cache is deliberately the most tightly bounded of these, because a long scrolling session can surface tens of thousands of accounts. It keeps a fixed 500 most-recently-seen accounts and evicts the oldest beyond that, stores only the handful of plain values it actually uses rather than X's original objects, truncates bios to 200 characters, and is discarded when the tab closes. Its memory ceiling is therefore a few hundred kilobytes regardless of how long the session runs.
 
@@ -245,7 +254,7 @@ The cache Worker validates contribution format and size, then stores the last ac
 ## Development
 
 <details>
-<summary><strong>Build, test, and source layout</strong></summary>
+<summary><strong>Build, checks, and source layout</strong></summary>
 
 The browser extension requires Node.js 18 or newer.
 

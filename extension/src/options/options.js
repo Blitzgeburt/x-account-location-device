@@ -4,7 +4,7 @@
  */
 
 import browserAPI from '../shared/browser-api.js';
-import { MESSAGE_TYPES, VERSION, COUNTRY_FLAGS, COUNTRY_LIST, REGION_LIST, REGION_FLAGS, REGION_NAMES, LANGUAGE_LIST, LANGUAGE_NAMES, PCF_LABELS, STORAGE_KEYS, TIMING } from '../shared/constants.js';
+import { MESSAGE_TYPES, VERSION, COUNTRY_FLAGS, COUNTRY_LIST, REGION_LIST, REGION_FLAGS, REGION_NAMES, LANGUAGE_LIST, LANGUAGE_NAMES, ACCOUNT_LABELS, STORAGE_KEYS, TIMING, canonicalCountry } from '../shared/constants.js';
 import { getFlagEmoji, formatCountryName, debounce, describeTagRisk } from '../shared/utils.js';
 import { deviceIcon, glyph } from '../content/icons.js';
 
@@ -398,7 +398,7 @@ function updateBlockedRegionsCount() {
 
 /**
  * The Tags panel holds three lists, each matched against a different part of an account:
- * the display name, the bio, and X's own Parody/Commentary/Fan label. They are rendered
+ * the display name, the bio, and X's own account label or grey badge. They are rendered
  * separately because presenting them as one list is what makes an over-matching term read
  * as a bug in the extension.
  */
@@ -527,7 +527,7 @@ function renderPcfLabels() {
     if (!container) return;
 
     container.replaceChildren();
-    for (const label of PCF_LABELS) {
+    for (const label of ACCOUNT_LABELS) {
         const isBlocked = blockedPcf.includes(label.value);
         const pill = document.createElement('button');
         pill.type = 'button';
@@ -1717,7 +1717,7 @@ function renderStatistics(stats) {
             barLabel.className = 'stat-bar-label';
             
             const countrySpan = document.createElement('span');
-            countrySpan.textContent = `${COUNTRY_FLAGS[c.country] || '🌍'} ${formatCountryName(c.country)}`;
+            countrySpan.textContent = `${COUNTRY_FLAGS[canonicalCountry(c.country)] || '🌍'} ${formatCountryName(c.country)}`;
             barLabel.appendChild(countrySpan);
             
             const countSpan = document.createElement('span');

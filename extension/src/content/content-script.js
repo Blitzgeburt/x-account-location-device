@@ -25,6 +25,7 @@ import {
     processElement,
     createProcessElementSafe,
     updateBlockedTweets,
+    resetProcessedElements,
     setupQuoteReveal,
     cleanupObservers,
     userInfoCache
@@ -80,7 +81,7 @@ function fetchUserInfoViaPage(screenName) {
     return new Promise(resolve => {
         const timeout = setTimeout(() => {
             window.removeEventListener('x-posed-fetch-user-info-result', onResult);
-            resolve({ success: false, error: 'Timed out waiting for page fetch' });
+            resolve({ success: false, code: 'TIMEOUT', error: 'Timed out waiting for page fetch' });
         }, 10000);
 
         function onResult(event) {
@@ -116,7 +117,7 @@ async function sendMessage(message) {
         return await browserAPI.runtime.sendMessage(message);
     } catch (error) {
         console.error('Message send error:', error);
-        return { success: false, error: error.message };
+        return { success: false, error: error.message, code: 'NETWORK_ERROR' };
     }
 }
 
@@ -218,6 +219,7 @@ function reprocessRowsMissingAffiliation() {
         .forEach(el => el.classList.remove('x-tweet-blocked', 'x-tweet-vpn-blocked', 'x-tweet-highlighted'));
     document.querySelectorAll('[data-x-block]').forEach(el => { delete el.dataset.xBlock; });
     document.querySelectorAll('[data-x-quote-block]').forEach(el => { delete el.dataset.xQuoteBlock; });
+    document.querySelectorAll('[data-x-quote-reason]').forEach(el => { delete el.dataset.xQuoteReason; });
 
     if (memoizedScanPageFn) memoizedScanPageFn();
 }
@@ -383,7 +385,7 @@ async function handleBackgroundMessage(type, payload) {
             debug('Settings updated:', settings);
             
             if (!isEnabled) {
-                document.querySelectorAll(`.${CSS_CLASSES.INFO_BADGE}`).forEach(el => el.remove());
+                resetProcessedElements();
             } else {
                 // Apply display/blocking toggles live to already-processed tweets, not
                 // only to newly-loaded ones. Clearing the processed markers + re-scanning
@@ -398,23 +400,10 @@ async function handleBackgroundMessage(type, payload) {
                 const reapplyKeys = ['showFlags', 'flagFromDevice', 'showDevices', 'showVpnIndicator',
                     'showCaptureButton', 'showVpnUsers', 'highlightBlockedTweets',
                     'showInfoIcon', 'hovercardTrigger'];
-                if (reapplyKeys.some(k => prevSettings[k] !== settings[k])) {
-                    document.querySelectorAll(`.${CSS_CLASSES.INFO_BADGE}`).forEach(el => el.remove());
-                    document.querySelectorAll('[data-x-processed]').forEach(el => {
-                        delete el.dataset.xProcessed;
-                        delete el.dataset.xScreenName;
-                    });
-                    // Drop our block/highlight markers before the rescan. A display:none row
-                    // has no layout box, so the IntersectionObserver never reports it visible
-                    // and it would never re-process — un-hiding first lets the rescan re-derive
-                    // each row's state from scratch (and re-hide it if it's still blocked).
-                    document.querySelectorAll('.x-tweet-blocked, .x-tweet-vpn-blocked, .x-tweet-highlighted')
-                        .forEach(el => el.classList.remove('x-tweet-blocked', 'x-tweet-vpn-blocked', 'x-tweet-highlighted'));
-                    document.querySelectorAll('[data-x-block]').forEach(el => { delete el.dataset.xBlock; });
-                    // Same reasoning for the language marker: a lang-hidden article is
-                    // display:none, so it must be un-hidden here or the rescan can't re-derive
-                    // it (e.g. when highlightBlockedTweets flips hide↔highlight).
-                    document.querySelectorAll('[data-x-lang-block]').forEach(el => { delete el.dataset.xLangBlock; });
+                if (prevSettings.enabled !== settings.enabled || reapplyKeys.some(k => prevSettings[k] !== settings[k])) {
+                    // Includes quote markers: their hidden username children cannot
+                    // reach the lazy rescan until the old collapse is released.
+                    resetProcessedElements(currentFilters());
                     if (memoizedScanPageFn) memoizedScanPageFn();
                 }
             }
@@ -608,7 +597,7 @@ async function initialize() {
             }
 
             readyWorkStarted = true;
-            startObserver(memoizedIsEnabledFn, memoizedProcessElementSafe, memoizedScanPageFn, debug);
+            startObserver(memoizedIsEnabledFn, memoizedProcessElementSafe, memoizedScanPageFn, debug, currentFilters);
 
             try {
                 detectAndApplyTheme(debug);

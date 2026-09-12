@@ -9,7 +9,7 @@
  */
 
 import browserAPI from '../shared/browser-api.js';
-import { CSS_CLASSES, MESSAGE_TYPES, Z_INDEX } from '../shared/constants.js';
+import { MESSAGE_TYPES, Z_INDEX } from '../shared/constants.js';
 import { LRUCache } from '../shared/lru-cache.js';
 import { deviceIcon, glyph, flagImage } from './icons.js';
 import { getProfile } from './profile-cache.js';
@@ -202,7 +202,7 @@ function describeHovercardError(response) {
     }
 }
 
-function buildCardContent({ screenName, info, loading = false, errorText = '' }) {
+function buildCardContent({ screenName, info, loading = false, errorText = '', allowlistControl = null }) {
     const card = ensureCard();
     card.replaceChildren();
 
@@ -375,6 +375,7 @@ function buildCardContent({ screenName, info, loading = false, errorText = '' })
     card.appendChild(createEl('span', 'x-posed-scanline'));
     card.appendChild(header);
     card.appendChild(body);
+    if (allowlistControl) card.appendChild(allowlistControl);
     return card;
 }
 
@@ -388,6 +389,10 @@ class HovercardController {
         this.card = null;
         this.hideTimeout = null;
         this.currentAnchor = null;
+        this.currentScreenName = '';
+        this.viewId = 0;
+        this.allowlistState = null;
+        this.allowlistWrites = new Map();
 
         // Per-session cache to avoid repeated API hits while you hover around.
         // Bounded LRU so a long browsing session can't grow it without limit
@@ -452,15 +457,21 @@ class HovercardController {
         }
 
         this.currentAnchor = anchorEl;
+        this.currentScreenName = String(screenName || '').toLowerCase();
+        const viewId = ++this.viewId;
+        this.allowlistState = this._createAllowlistState(this.currentScreenName, viewId);
 
         // Show immediate card (using whatever we currently know)
-        this.card = buildCardContent({ screenName, info, loading: true });
+        this.card = buildCardContent({
+            screenName, info, loading: true, allowlistControl: this.allowlistState?.element
+        });
         this.card.classList.add('x-posed-hovercard-visible');
         positionCard(this.card, anchorEl);
+        if (this.allowlistState) this._loadAllowlist(this.allowlistState);
 
         // Fetch rich metadata ONLY on hover (forces API), with short TTL caching.
         // Pass the badge's known info so an error card can still show it (issue #14).
-        this._fetchAndUpdate(anchorEl, screenName, csrfToken, info).catch(() => {});
+        this._fetchAndUpdate(anchorEl, screenName, csrfToken, info, viewId).catch(() => {});
 
         // Keep visible if hovering card (hover mode only — see _clickMode above)
         this.card.removeEventListener('mouseenter', this._handleCardEnter);
@@ -501,6 +512,9 @@ class HovercardController {
         }
 
         this.currentAnchor = null;
+        this.currentScreenName = '';
+        this.allowlistState = null;
+        this.viewId++;
         window.removeEventListener('scroll', this._handleScroll, true);
         window.removeEventListener('resize', this._handleScroll, true);
         document.removeEventListener('pointerdown', this._handleOutsideTap, true);
@@ -525,14 +539,128 @@ class HovercardController {
         this.hide();
     }
 
-    async _fetchAndUpdate(anchorEl, screenName, csrfToken, initialInfo = {}) {
+    _isCurrentView(anchorEl, screenName, viewId) {
+        return this.viewId === viewId && this.currentAnchor === anchorEl &&
+            this.currentScreenName === String(screenName || '').toLowerCase() &&
+            anchorEl?.isConnected && this.card?.classList.contains('x-posed-hovercard-visible');
+    }
+
+    _isCurrentAllowlist(state) {
+        return this.allowlistState === state &&
+            this._isCurrentView(this.currentAnchor, state.handle, state.viewId) &&
+            this.card.contains(state.element);
+    }
+
+    _createAllowlistState(handle, viewId) {
+        if (!/^[a-z0-9_]{1,15}$/.test(handle)) return null;
+        const element = createEl('div', 'x-posed-card-actions');
+        const button = createEl('button', 'x-blocker-btn x-blocker-btn-secondary x-posed-allowlist-button');
+        button.type = 'button';
+        const status = createEl('div', 'x-posed-allowlist-status');
+        status.setAttribute('aria-live', 'polite');
+        element.append(button, status);
+        const state = { handle, viewId, element, button, status, allowed: null, pending: true, error: '', message: '' };
+        this._renderAllowlist(state);
+        button.addEventListener('click', event => {
+            event.preventDefault();
+            event.stopPropagation();
+            if (!this._isCurrentAllowlist(state) || state.pending) return;
+            if (state.allowed === null) this._loadAllowlist(state);
+            else this._setAllowedUser(state);
+        });
+        return state;
+    }
+
+    _renderAllowlist(state) {
+        const { button, status, handle, allowed, pending } = state;
+        button.disabled = pending;
+        button.setAttribute('aria-busy', String(pending));
+        button.setAttribute('aria-pressed', String(allowed === true));
+        button.textContent = pending && allowed !== null ? 'Saving…'
+            : state.error && allowed === null ? 'Retry Always Show'
+                : allowed ? `Stop always showing @${handle}` : `Always show @${handle}`;
+        button.title = allowed ? 'Apply your filters to this account again.' : 'Exempt this account from your filters.';
+        status.textContent = state.error || state.message || (pending && allowed === null ? 'Checking Always Show…' : '');
+        status.hidden = !status.textContent;
+        status.setAttribute('role', state.error ? 'alert' : 'status');
+        status.classList.toggle('x-posed-allowlist-error', !!state.error);
+        if (this._isCurrentAllowlist(state)) positionCard(this.card, this.currentAnchor);
+    }
+
+    async _loadAllowlist(state) {
+        if (!this._isCurrentAllowlist(state)) return;
+        state.pending = true;
+        state.error = '';
+        state.message = '';
+        this._renderAllowlist(state);
+        try {
+            // Reopening this account while its previous card is still saving must
+            // read membership after that write, otherwise the new card sees old state.
+            const pendingWrite = this.allowlistWrites.get(state.handle);
+            if (pendingWrite) {
+                try { await pendingWrite; } catch { /* Read the actual state after a failed write too. */ }
+                if (!this._isCurrentAllowlist(state)) return;
+            }
+            const response = await browserAPI.runtime.sendMessage({ type: MESSAGE_TYPES.GET_ALLOWED_USERS });
+            if (!this._isCurrentAllowlist(state)) return;
+            if (!response?.success || !Array.isArray(response.data)) throw new Error('Allowlist unavailable');
+            state.allowed = response.data.some(handle => typeof handle === 'string' && handle.toLowerCase() === state.handle);
+        } catch {
+            if (!this._isCurrentAllowlist(state)) return;
+            state.error = 'Couldn’t load Always Show. Try again.';
+        } finally {
+            if (this._isCurrentAllowlist(state)) {
+                state.pending = false;
+                this._renderAllowlist(state);
+            }
+        }
+    }
+
+    async _setAllowedUser(state) {
+        if (!this._isCurrentAllowlist(state) || state.pending || state.allowed === null) return;
+        const shouldAllow = !state.allowed;
+        state.pending = true;
+        state.error = '';
+        state.message = '';
+        this._renderAllowlist(state);
+        try {
+            // Send an explicit operation for the captured handle. Never replace the list:
+            // another tab may have edited it since this card's initial membership check.
+            const write = browserAPI.runtime.sendMessage({
+                type: MESSAGE_TYPES.SET_ALLOWED_USERS,
+                payload: { action: shouldAllow ? 'add' : 'remove', username: state.handle }
+            });
+            this.allowlistWrites.set(state.handle, write);
+            const response = await write.finally(() => {
+                if (this.allowlistWrites.get(state.handle) === write) this.allowlistWrites.delete(state.handle);
+            });
+            if (!this._isCurrentAllowlist(state)) return;
+            if (!response?.success || !Array.isArray(response.data)) throw new Error('Allowlist update failed');
+            const confirmed = response.data.some(handle => typeof handle === 'string' && handle.toLowerCase() === state.handle);
+            if (confirmed !== shouldAllow) throw new Error('Allowlist update not confirmed');
+            state.allowed = confirmed;
+            state.message = confirmed ? `Always showing @${state.handle}.` : `Filters apply to @${state.handle} again.`;
+        } catch {
+            if (!this._isCurrentAllowlist(state)) return;
+            state.error = 'Couldn’t update Always Show. Try again.';
+        } finally {
+            if (this._isCurrentAllowlist(state)) {
+                state.pending = false;
+                this._renderAllowlist(state);
+            }
+        }
+    }
+
+    async _fetchAndUpdate(anchorEl, screenName, csrfToken, initialInfo = {}, viewId = this.viewId) {
         const key = String(screenName || '').toLowerCase();
         if (!key) return;
 
         const cached = this.hoverCache.get(key);
         if (cached && Date.now() - cached.fetchedAt < this.cacheTtlMs) {
-            if (this.currentAnchor === anchorEl && this.card?.classList.contains('x-posed-hovercard-visible')) {
-                this.card = buildCardContent({ screenName, info: cached.data, loading: false });
+            if (this._isCurrentView(anchorEl, screenName, viewId)) {
+                this.card = buildCardContent({
+                    screenName, info: cached.data, loading: false, allowlistControl: this.allowlistState?.element
+                });
                 this.card.classList.add('x-posed-hovercard-visible');
                 positionCard(this.card, anchorEl);
             }
@@ -555,8 +683,10 @@ class HovercardController {
 
         if (!response?.success || !response.data) {
             const msg = describeHovercardError(response);
-            if (this.currentAnchor === anchorEl && this.card?.classList.contains('x-posed-hovercard-visible')) {
-                this.card = buildCardContent({ screenName, info: initialInfo, loading: false, errorText: msg });
+            if (this._isCurrentView(anchorEl, screenName, viewId)) {
+                this.card = buildCardContent({
+                    screenName, info: initialInfo, loading: false, errorText: msg, allowlistControl: this.allowlistState?.element
+                });
                 this.card.classList.add('x-posed-hovercard-visible');
                 positionCard(this.card, anchorEl);
             }
@@ -579,8 +709,10 @@ class HovercardController {
             } catch { /* CustomEvent unsupported — non-fatal */ }
         }
 
-        if (this.currentAnchor === anchorEl && this.card?.classList.contains('x-posed-hovercard-visible')) {
-            this.card = buildCardContent({ screenName, info: response.data, loading: false });
+        if (this._isCurrentView(anchorEl, screenName, viewId)) {
+            this.card = buildCardContent({
+                screenName, info: response.data, loading: false, allowlistControl: this.allowlistState?.element
+            });
             this.card.classList.add('x-posed-hovercard-visible');
             positionCard(this.card, anchorEl);
         }
@@ -609,6 +741,7 @@ class HovercardController {
         this.hide();
         this.hoverCache.clear();
         this.inFlight.clear();
+        this.allowlistWrites.clear();
 
         const card = document.getElementById(CARD_ID);
         if (card) card.remove();
