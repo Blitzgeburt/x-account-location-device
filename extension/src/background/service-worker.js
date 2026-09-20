@@ -10,7 +10,7 @@
 
 import browserAPI from '../shared/browser-api.js';
 import { MESSAGE_TYPES, VERSION, STORAGE_KEYS, TIMING, affiliationWasChecked } from '../shared/constants.js';
-import { userCache, blockedCountries, blockedRegions, blockedTags, blockedBioTags, blockedPcf, blockedLanguages, blockedAffiliations, allowedUsers, settings, headersStorage, initializeStorage } from '../shared/storage.js';
+import { userCache, blockedCountries, blockedRegions, blockedTags, blockedBioTags, blockedPcf, blockedLanguages, blockedAffiliations, blockedLinks, allowedUsers, settings, headersStorage, initializeStorage } from '../shared/storage.js';
 import { apiClient, API_ERROR_CODES } from './api-client.js';
 import { calculateStatistics } from '../shared/utils.js';
 import cloudCache from './cloud-cache.js';
@@ -135,6 +135,14 @@ async function handleMessage(message, _sender) {
 
             case MESSAGE_TYPES.SET_BLOCKED_AFFILIATIONS:
                 return await handleSetBlockedAffiliations(payload);
+
+            case MESSAGE_TYPES.GET_BLOCKED_LINKS:
+                return handleGetBlockedSet(blockedLinks);
+
+            case MESSAGE_TYPES.SET_BLOCKED_LINKS:
+                return await handleSetBlockedSet(blockedLinks, MESSAGE_TYPES.BLOCKED_LINKS_UPDATED, {
+                    action: payload?.action, value: payload?.link, values: payload?.links
+                });
 
             case MESSAGE_TYPES.GET_ALLOWED_USERS:
                 return handleGetAllowedUsers();
@@ -547,20 +555,45 @@ async function broadcastToTabs(message) {
 }
 
 /**
- * Set settings handler
+ * Broadcast to every UI surface that mirrors extension state: X/Twitter tabs (content
+ * script + the sidebar modal) via tabs.sendMessage, AND extension pages such as
+ * options.html via runtime.sendMessage. Neither API reaches the other's targets, so a
+ * change made in one surface only shows up live in the other if both are notified.
+ *
+ * Every blocklist/settings change goes through here so that the sidebar and the options
+ * page stay in sync without either being refreshed. The runtime.sendMessage half is
+ * fire-and-forget: with no options page open it has no receiver and rejects, which is
+ * expected and swallowed.
+ */
+function broadcastToAll(message) {
+    return Promise.all([
+        broadcastToTabs(message),
+        browserAPI.runtime.sendMessage(message).catch(() => {})
+    ]);
+}
+
+/**
+ * Set settings handler.
+ *
+ * Broadcasts to both audiences (X/Twitter content-script tabs and extension pages such
+ * as options.html) — see broadcastToAll. A settings change made anywhere (the options
+ * page, the sidebar's hide/highlight toggle, the toggle-blocking-mode keyboard shortcut)
+ * therefore reaches every other open surface without a refresh.
  */
 async function handleSetSettings(newSettings) {
     await settings.set(newSettings);
+    const updatedSettings = settings.get();
 
-    // Notify all tabs (fire-and-forget): the caller's response shouldn't wait on a
-    // tabs.query + per-tab message round-trip, and the broadcast already swallows errors.
-    broadcastToTabs({
+    // Fire-and-forget: the caller's response shouldn't wait on a tabs.query + per-tab
+    // message round-trip, and the broadcast already swallows errors.
+    broadcastToAll({
         type: MESSAGE_TYPES.SETTINGS_UPDATED,
-        payload: settings.get()
+        payload: updatedSettings
     });
 
-    return { success: true, data: settings.get() };
+    return { success: true, data: updatedSettings };
 }
+
 
 /**
  * Get blocked countries handler
@@ -611,8 +644,9 @@ async function handleSetBlockedSet(store, updatedType, { action, value, values }
             break;
     }
 
-    // Notify all tabs (fire-and-forget — don't block the caller's response on it).
-    broadcastToTabs({
+    // Notify every open surface — X tabs (and the sidebar modal in them) and the options
+    // page — fire-and-forget so the caller's response isn't blocked on it.
+    broadcastToAll({
         type: updatedType,
         payload: store.getAll()
     });
@@ -946,7 +980,7 @@ async function handleSyncLocalToCloud() {
 /**
  * Import data handler - imports settings, blocked countries, blocked regions, and cache from exported JSON
  */
-async function handleImportData({ settings: importSettings, blockedCountries: importBlockedCountries, blockedRegions: importBlockedRegions, blockedTags: importBlockedTags, blockedBioTags: importBlockedBioTags, blockedPcf: importBlockedPcf, blockedLanguages: importBlockedLanguages, blockedAffiliations: importBlockedAffiliations, allowedUsers: importAllowedUsers, cache: importCache }) {
+async function handleImportData({ settings: importSettings, blockedCountries: importBlockedCountries, blockedRegions: importBlockedRegions, blockedTags: importBlockedTags, blockedBioTags: importBlockedBioTags, blockedPcf: importBlockedPcf, blockedLanguages: importBlockedLanguages, blockedAffiliations: importBlockedAffiliations, blockedLinks: importBlockedLinks, allowedUsers: importAllowedUsers, cache: importCache }) {
     const results = {
         settings: false,
         blockedCountries: { count: 0 },
@@ -960,6 +994,7 @@ async function handleImportData({ settings: importSettings, blockedCountries: im
         // TypeError mid-import — leaving allowlist and cache unimported and no tab
         // broadcast sent, reported to the user only as "Cannot read properties of undefined".
         blockedAffiliations: { count: 0 },
+        blockedLinks: { count: 0 },
         allowedUsers: { count: 0 },
         cache: { count: 0 }
     };
@@ -1013,6 +1048,14 @@ async function handleImportData({ settings: importSettings, blockedCountries: im
             results.blockedAffiliations.count = importBlockedAffiliations.length;
         }
 
+        // Import blocked linked domains if provided (one mutation + one write)
+        if (Array.isArray(importBlockedLinks)) {
+            await blockedLinks.setAll(importBlockedLinks);
+            // setAll drops entries that don't normalize, so report what was stored rather
+            // than what the file claimed.
+            results.blockedLinks.count = blockedLinks.size;
+        }
+
         // Import allowlisted ("always show") accounts if provided (one mutation + one write)
         if (Array.isArray(importAllowedUsers)) {
             await allowedUsers.setAll(importAllowedUsers);
@@ -1034,17 +1077,18 @@ async function handleImportData({ settings: importSettings, blockedCountries: im
             }
         }
         
-        // Notify all tabs about updates (parallelized - all messages sent concurrently)
+        // Notify all tabs and extension pages about updates (all messages sent concurrently)
         await Promise.all([
-            broadcastToTabs({ type: MESSAGE_TYPES.SETTINGS_UPDATED, payload: settings.get() }),
-            broadcastToTabs({ type: MESSAGE_TYPES.BLOCKED_COUNTRIES_UPDATED, payload: blockedCountries.getAll() }),
-            broadcastToTabs({ type: MESSAGE_TYPES.BLOCKED_REGIONS_UPDATED, payload: blockedRegions.getAll() }),
-            broadcastToTabs({ type: MESSAGE_TYPES.BLOCKED_TAGS_UPDATED, payload: blockedTags.getAll() }),
-            broadcastToTabs({ type: MESSAGE_TYPES.BLOCKED_BIO_TAGS_UPDATED, payload: blockedBioTags.getAll() }),
-            broadcastToTabs({ type: MESSAGE_TYPES.BLOCKED_PCF_UPDATED, payload: blockedPcf.getAll() }),
-            broadcastToTabs({ type: MESSAGE_TYPES.BLOCKED_LANGUAGES_UPDATED, payload: blockedLanguages.getAll() }),
-            broadcastToTabs({ type: MESSAGE_TYPES.BLOCKED_AFFILIATIONS_UPDATED, payload: blockedAffiliations.getAll() }),
-            broadcastToTabs({ type: MESSAGE_TYPES.ALLOWED_USERS_UPDATED, payload: allowedUsers.getAll() })
+            broadcastToAll({ type: MESSAGE_TYPES.SETTINGS_UPDATED, payload: settings.get() }),
+            broadcastToAll({ type: MESSAGE_TYPES.BLOCKED_COUNTRIES_UPDATED, payload: blockedCountries.getAll() }),
+            broadcastToAll({ type: MESSAGE_TYPES.BLOCKED_REGIONS_UPDATED, payload: blockedRegions.getAll() }),
+            broadcastToAll({ type: MESSAGE_TYPES.BLOCKED_TAGS_UPDATED, payload: blockedTags.getAll() }),
+            broadcastToAll({ type: MESSAGE_TYPES.BLOCKED_BIO_TAGS_UPDATED, payload: blockedBioTags.getAll() }),
+            broadcastToAll({ type: MESSAGE_TYPES.BLOCKED_PCF_UPDATED, payload: blockedPcf.getAll() }),
+            broadcastToAll({ type: MESSAGE_TYPES.BLOCKED_LANGUAGES_UPDATED, payload: blockedLanguages.getAll() }),
+            broadcastToAll({ type: MESSAGE_TYPES.BLOCKED_AFFILIATIONS_UPDATED, payload: blockedAffiliations.getAll() }),
+            broadcastToAll({ type: MESSAGE_TYPES.BLOCKED_LINKS_UPDATED, payload: blockedLinks.getAll() }),
+            broadcastToAll({ type: MESSAGE_TYPES.ALLOWED_USERS_UPDATED, payload: allowedUsers.getAll() })
         ]);
 
         return {
@@ -1057,6 +1101,7 @@ async function handleImportData({ settings: importSettings, blockedCountries: im
             importedBlockedPcf: results.blockedPcf.count,
             importedBlockedLanguages: results.blockedLanguages.count,
             importedBlockedAffiliations: results.blockedAffiliations.count,
+            importedBlockedLinks: results.blockedLinks.count,
             importedAllowedUsers: results.allowedUsers.count,
             importedCache: results.cache.count
         };
@@ -1072,6 +1117,7 @@ async function handleImportData({ settings: importSettings, blockedCountries: im
             importedBlockedPcf: results.blockedPcf.count,
             importedBlockedLanguages: results.blockedLanguages.count,
             importedBlockedAffiliations: results.blockedAffiliations.count,
+            importedBlockedLinks: results.blockedLinks.count,
             importedAllowedUsers: results.allowedUsers.count,
             importedCache: results.cache.count
         };
@@ -1212,6 +1258,22 @@ if (runtimeNS?.runtime?.onInstalled) {
 }
 if (runtimeNS?.runtime?.onStartup) {
     runtimeNS.runtime.onStartup.addListener(handleStartup);
+}
+if (runtimeNS?.commands?.onCommand) {
+    runtimeNS.commands.onCommand.addListener(async command => {
+        if (command !== 'toggle-blocking-mode') return;
+
+        await initialize();
+        // Send only the key that changed: SET_SETTINGS merges, so there's no reason to
+        // write back a snapshot of every other setting.
+        const updatedSettings = {
+            highlightBlockedTweets: settings.get('highlightBlockedTweets') !== true
+        };
+        // handleSetSettings() broadcasts SETTINGS_UPDATED to both X/Twitter tabs
+        // and any open extension page like options.html (broadcastToAll) — so no
+        // separate broadcast is needed here.
+        await handleSetSettings(updatedSettings);
+    });
 }
 
 // Flush deferred writes before the background suspends (reliable on Firefox event

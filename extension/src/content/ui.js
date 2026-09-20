@@ -641,6 +641,16 @@ export function removeSidebarLink(debug) {
 }
 
 /**
+ * Keep the modal toggle state in sync when settings are changed elsewhere.
+ */
+export function syncSidebarBlockingMode(highlightMode) {
+    const control = document.querySelector('.x-blocker-mode-control');
+    if (!control) return;
+    control.classList.toggle('highlight', highlightMode === true);
+    control.setAttribute('aria-pressed', highlightMode === true ? 'true' : 'false');
+}
+
+/**
  * Add blocker link to sidebar
  */
 function addBlockerLink(nav, blockedCountries, blockedRegions, sendMessage, MESSAGE_TYPES) {
@@ -713,6 +723,32 @@ function addBlockerLink(nav, blockedCountries, blockedRegions, sendMessage, MESS
  * Show the country/region blocker modal
  */
 async function showBlockerModal(blockedCountries, blockedRegions, sendMessage, MESSAGE_TYPES) {
+    // Read affiliations straight from the background rather than the content script's
+    // snapshot. The snapshot is only as fresh as the last broadcast this tab received, so
+    // a tab that missed one would open the modal showing an empty list while Settings
+    // shows entries. Falls back to the snapshot if the message fails. Done BEFORE the
+    // synchronous state read below so nothing can change between reading and opening.
+    let affiliationsSnapshot = null;
+    try {
+        const affiliationsResponse = await sendMessage({ type: MESSAGE_TYPES.GET_BLOCKED_AFFILIATIONS });
+        if (affiliationsResponse?.success && Array.isArray(affiliationsResponse.data)) {
+            affiliationsSnapshot = affiliationsResponse.data;
+        }
+    } catch {
+        // Keep the snapshot value — the modal still opens, just possibly stale.
+    }
+
+    // Tags, bio tags, links, labels and languages come from the content script's state
+    // (window.__X_POSED_CONTENT__); the modal then keeps itself current via syncModalState.
+    const state = window.__X_POSED_CONTENT__?.getState?.() || {};
+    const currentSettings = state.settings || {};
+    const blockedTags = new Set(state.blockedTags || []);
+    const blockedBioTags = new Set(state.blockedBioTags || []);
+    const blockedLinks = new Set(state.blockedLinks || []);
+    const blockedPcf = new Set(state.blockedPcf || []);
+    const blockedLanguages = new Set(state.blockedLanguages || []);
+    const blockedAffiliations = new Set(affiliationsSnapshot || state.blockedAffiliations || []);
+
     // Country action handler
     const onCountryAction = async (action, country) => {
         const response = await sendMessage({
@@ -749,27 +785,6 @@ async function showBlockerModal(blockedCountries, blockedRegions, sendMessage, M
         return response;
     };
     
-    // Get blockedTags + blockedLanguages from the global state (window.__X_POSED_CONTENT__)
-    const state = window.__X_POSED_CONTENT__?.getState?.() || {};
-    const blockedTags = new Set(state.blockedTags || []);
-    const blockedBioTags = new Set(state.blockedBioTags || []);
-    const blockedPcf = new Set(state.blockedPcf || []);
-    const blockedLanguages = new Set(state.blockedLanguages || []);
-
-    // Read affiliations straight from the background rather than the content script's
-    // snapshot. The snapshot is only as fresh as the last broadcast this tab received, so
-    // a tab that missed one would open the modal showing an empty list while Settings
-    // shows entries. Falls back to the snapshot if the message fails.
-    let blockedAffiliations = new Set(state.blockedAffiliations || []);
-    try {
-        const affiliationsResponse = await sendMessage({ type: MESSAGE_TYPES.GET_BLOCKED_AFFILIATIONS });
-        if (affiliationsResponse?.success && Array.isArray(affiliationsResponse.data)) {
-            blockedAffiliations = new Set(affiliationsResponse.data);
-        }
-    } catch {
-        // Keep the snapshot value — the modal still opens, just possibly stale.
-    }
-
     // Tag action handler
     const onTagAction = async (action, tag) => {
         const response = await sendMessage({
@@ -831,6 +846,14 @@ async function showBlockerModal(blockedCountries, blockedRegions, sendMessage, M
         return response;
     };
 
+    // Send only the key that changed. SET_SETTINGS merges, and `currentSettings` is a
+    // snapshot from when the modal opened: writing all of it back would revert anything
+    // changed since — in the options page or by the keyboard shortcut.
+    const onBlockingModeChange = highlight => sendMessage({
+        type: MESSAGE_TYPES.SET_SETTINGS,
+        payload: { highlightBlockedTweets: highlight }
+    });
+
     showModal({
         blockedCountries,
         blockedRegions,
@@ -840,12 +863,16 @@ async function showBlockerModal(blockedCountries, blockedRegions, sendMessage, M
         onTagAction,
         blockedBioTags,
         onBioTagAction: makeSetHandler(MESSAGE_TYPES.SET_BLOCKED_BIO_TAGS, 'tag', blockedBioTags),
+        blockedLinks,
+        onLinkAction: makeSetHandler(MESSAGE_TYPES.SET_BLOCKED_LINKS, 'link', blockedLinks),
         blockedPcf,
         onPcfAction: makeSetHandler(MESSAGE_TYPES.SET_BLOCKED_PCF, 'label', blockedPcf),
         blockedLanguages,
         onLanguageAction,
         blockedAffiliations,
-        onAffiliationAction
+        onAffiliationAction,
+        highlightBlockedTweets: currentSettings.highlightBlockedTweets === true,
+        onBlockingModeChange
     });
 }
 

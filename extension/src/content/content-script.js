@@ -14,9 +14,12 @@ import {
     startThemeObserver,
     injectSidebarLink,
     removeSidebarLink,
+    syncSidebarBlockingMode,
     cleanupUI,
     showToast
 } from './ui.js';
+
+import { syncModalState } from './modal.js';
 
 import {
     startObserver,
@@ -48,6 +51,7 @@ let blockedPcf = new Set();
 let blockedLanguages = new Set();
 let allowedUsers = new Set();
 let blockedAffiliations = new Set();
+let blockedLinks = new Set();
 let settings = {};
 let csrfToken = null;
 let debugMode = false;
@@ -220,6 +224,7 @@ function reprocessRowsMissingAffiliation() {
     document.querySelectorAll('[data-x-block]').forEach(el => { delete el.dataset.xBlock; });
     document.querySelectorAll('[data-x-quote-block]').forEach(el => { delete el.dataset.xQuoteBlock; });
     document.querySelectorAll('[data-x-quote-reason]').forEach(el => { delete el.dataset.xQuoteReason; });
+    document.querySelectorAll('[data-x-quote-label]').forEach(el => { delete el.dataset.xQuoteLabel; });
 
     if (memoizedScanPageFn) memoizedScanPageFn();
 }
@@ -237,6 +242,7 @@ function currentFilters() {
         blockedPcf,
         blockedLanguages,
         blockedAffiliations,
+        blockedLinks,
         allowedUsers,
         settings
     };
@@ -276,6 +282,7 @@ function setupProfileListener() {
         for (const entry of users) {
             setProfile(entry.u, {
                 bio: entry.b,
+                links: entry.l,
                 pcf: entry.p,
                 followers: entry.f,
                 following: entry.g,
@@ -285,9 +292,10 @@ function setupProfileListener() {
         }
         debug(`Harvested ${users.length} profile(s) from X's own response`);
 
-        // Newly known bios/labels can change a row's verdict, so re-derive what's on screen.
-        // Coalesced by updateBlockedTweets, so a burst of scroll responses costs one pass.
-        if (blockedBioTags.size > 0 || blockedPcf.size > 0) {
+        // Newly known bios/labels/links can change a row's verdict, so re-derive what's on
+        // screen. Coalesced by updateBlockedTweets, so a burst of scroll responses costs
+        // one pass.
+        if (blockedBioTags.size > 0 || blockedPcf.size > 0 || blockedLinks.size > 0) {
             updateBlockedTweets(currentFilters());
         }
     };
@@ -380,6 +388,9 @@ async function handleBackgroundMessage(type, payload) {
         case MESSAGE_TYPES.SETTINGS_UPDATED: {
             const prevSettings = { ...settings };
             settings = payload;
+            // Hide/Highlight can flip from the keyboard shortcut or the options page while
+            // the sidebar modal is open; mirror it into the modal's toggle.
+            syncSidebarBlockingMode(settings.highlightBlockedTweets === true);
             isEnabled = settings.enabled !== false;
             debugMode = settings.debugMode === true;
             debug('Settings updated:', settings);
@@ -424,36 +435,43 @@ async function handleBackgroundMessage(type, payload) {
 
         case MESSAGE_TYPES.BLOCKED_COUNTRIES_UPDATED:
             blockedCountries = new Set(payload);
+            syncModalState('countries', payload);
             updateBlockedTweets(currentFilters());
             return { success: true };
 
         case MESSAGE_TYPES.BLOCKED_REGIONS_UPDATED:
             blockedRegions = new Set(payload);
+            syncModalState('regions', payload);
             updateBlockedTweets(currentFilters());
             return { success: true };
 
         case MESSAGE_TYPES.BLOCKED_TAGS_UPDATED:
             blockedTags = new Set(payload);
+            syncModalState('tags', payload);
             updateBlockedTweets(currentFilters());
             return { success: true };
 
         case MESSAGE_TYPES.BLOCKED_BIO_TAGS_UPDATED:
             blockedBioTags = new Set(payload);
+            syncModalState('bioTags', payload);
             updateBlockedTweets(currentFilters());
             return { success: true };
 
         case MESSAGE_TYPES.BLOCKED_PCF_UPDATED:
             blockedPcf = new Set(payload);
+            syncModalState('pcf', payload);
             updateBlockedTweets(currentFilters());
             return { success: true };
 
         case MESSAGE_TYPES.BLOCKED_LANGUAGES_UPDATED:
             blockedLanguages = new Set(payload);
+            syncModalState('languages', payload);
             updateBlockedTweets(currentFilters());
             return { success: true };
 
         case MESSAGE_TYPES.BLOCKED_AFFILIATIONS_UPDATED:
             blockedAffiliations = new Set(payload);
+            syncModalState('affiliations', payload);
             if (blockedAffiliations.size > 0) {
                 // Rows already on screen were resolved before this filter existed, and a
                 // community-cache hit carries no affiliation at all. Re-deriving from that
@@ -465,6 +483,12 @@ async function handleBackgroundMessage(type, payload) {
             } else {
                 updateBlockedTweets(currentFilters());
             }
+            return { success: true };
+
+        case MESSAGE_TYPES.BLOCKED_LINKS_UPDATED:
+            blockedLinks = new Set(payload);
+            syncModalState('links', payload);
+            updateBlockedTweets(currentFilters());
             return { success: true };
 
         case MESSAGE_TYPES.ALLOWED_USERS_UPDATED:
@@ -528,7 +552,7 @@ async function initialize() {
         injectPageScript();
 
         // Load initial settings, blocked countries/regions/tags/languages, and allowlisted accounts
-        const [settingsResponse, blockedResponse, blockedRegionsResponse, blockedTagsResponse, blockedBioTagsResponse, blockedPcfResponse, blockedLanguagesResponse, allowedUsersResponse, blockedAffiliationsResponse] = await Promise.all([
+        const [settingsResponse, blockedResponse, blockedRegionsResponse, blockedTagsResponse, blockedBioTagsResponse, blockedPcfResponse, blockedLanguagesResponse, allowedUsersResponse, blockedAffiliationsResponse, blockedLinksResponse] = await Promise.all([
             sendMessage({ type: MESSAGE_TYPES.GET_SETTINGS }),
             sendMessage({ type: MESSAGE_TYPES.GET_BLOCKED_COUNTRIES }),
             sendMessage({ type: MESSAGE_TYPES.GET_BLOCKED_REGIONS }),
@@ -537,7 +561,8 @@ async function initialize() {
             sendMessage({ type: MESSAGE_TYPES.GET_BLOCKED_PCF }),
             sendMessage({ type: MESSAGE_TYPES.GET_BLOCKED_LANGUAGES }),
             sendMessage({ type: MESSAGE_TYPES.GET_ALLOWED_USERS }),
-            sendMessage({ type: MESSAGE_TYPES.GET_BLOCKED_AFFILIATIONS })
+            sendMessage({ type: MESSAGE_TYPES.GET_BLOCKED_AFFILIATIONS }),
+            sendMessage({ type: MESSAGE_TYPES.GET_BLOCKED_LINKS })
         ]);
 
         if (settingsResponse?.success) {
@@ -581,6 +606,9 @@ async function initialize() {
 
         if (blockedAffiliationsResponse?.success) {
             blockedAffiliations = new Set(blockedAffiliationsResponse.data);
+        }
+        if (blockedLinksResponse?.success) {
+            blockedLinks = new Set(blockedLinksResponse.data);
         }
 
         createMemoizedFunctions();
@@ -646,6 +674,7 @@ function createMemoizedFunctions() {
         get blockedLanguages() { return blockedLanguages; },
         get allowedUsers() { return allowedUsers; },
         get blockedAffiliations() { return blockedAffiliations; },
+        get blockedLinks() { return blockedLinks; },
         get settings() { return settings; },
         get csrfToken() { return csrfToken; },
         sendMessage,
@@ -742,6 +771,7 @@ window.__X_POSED_CONTENT__ = {
         blockedLanguages: Array.from(blockedLanguages),
         allowedUsers: Array.from(allowedUsers),
         blockedAffiliations: Array.from(blockedAffiliations),
+        blockedLinks: Array.from(blockedLinks),
         settings
     })
 };

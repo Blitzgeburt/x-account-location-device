@@ -70,6 +70,16 @@
     "default_title": "X-Posed"
   },
 
+  "commands": {
+    "toggle-blocking-mode": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+B",
+        "mac": "Command+Shift+B"
+      },
+      "description": "Toggle blocking mode"
+    }
+  },
+
   "options_ui": {
     "page": "options/options.html",
     "open_in_tab": true

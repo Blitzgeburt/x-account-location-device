@@ -4,7 +4,7 @@
  * Uses tabbed interface for switching between countries and regions
  */
 
-import { COUNTRY_LIST, REGION_LIST, LANGUAGE_LIST, ACCOUNT_LABELS, CSS_CLASSES, TIMING } from '../shared/constants.js';
+import { COUNTRY_LIST, REGION_LIST, LANGUAGE_LIST, ACCOUNT_LABELS, CSS_CLASSES, TIMING, normalizeHost } from '../shared/constants.js';
 import { formatCountryName, createElement, debounce, describeTagRisk } from '../shared/utils.js';
 import { glyph, flagImage } from './icons.js';
 
@@ -13,11 +13,16 @@ let localBlockedCountries = null;
 let localBlockedRegions = null;
 let localBlockedTags = null;
 let localBlockedBioTags = null;
+let localBlockedLinks = null;
 let localBlockedPcf = null;
 let localBlockedLanguages = null;
 let localBlockedAffiliations = null;
 
 let currentModal = null;
+// Closes the modal that is currently open (also detaches its Escape handler).
+let closeCurrentModal = null;
+// Handle to the open modal's live-sync entry point; null while the modal is closed.
+let modalSync = null;
 
 // Memoized filtering for performance
 let cachedFilteredCountries = null;
@@ -46,22 +51,22 @@ export function showModal(config = {}) {
         blockedCountries, blockedRegions, onCountryAction, onRegionAction,
         blockedTags = null, onTagAction = null,
         blockedBioTags = null, onBioTagAction = null,
+        blockedLinks = null, onLinkAction = null,
         blockedPcf = null, onPcfAction = null,
         blockedLanguages = null, onLanguageAction = null,
-        blockedAffiliations = null, onAffiliationAction = null
+        blockedAffiliations = null, onAffiliationAction = null,
+        highlightBlockedTweets = false, onBlockingModeChange = null
     } = config;
 
     // Remove existing modal if present
-    if (currentModal) {
-        currentModal.remove();
-        currentModal = null;
-    }
+    if (closeCurrentModal) closeCurrentModal();
 
     // Store references for syncing
     localBlockedCountries = blockedCountries;
     localBlockedRegions = blockedRegions;
     localBlockedTags = blockedTags || new Set();
     localBlockedBioTags = blockedBioTags || new Set();
+    localBlockedLinks = blockedLinks || new Set();
     localBlockedPcf = blockedPcf || new Set();
     localBlockedLanguages = blockedLanguages || new Set();
     localBlockedAffiliations = blockedAffiliations || new Set();
@@ -77,11 +82,23 @@ export function showModal(config = {}) {
         className: CSS_CLASSES.MODAL
     });
 
-    // Create header
-    const header = createHeader(() => {
+    // Single teardown path for every way the modal can close (X button, Done, overlay
+    // click, Escape) so the Escape listener and the live-sync handle never outlive it.
+    const handleKeydown = e => {
+        if (e.key === 'Escape') {
+            closeModal();
+        }
+    };
+    const closeModal = () => {
+        document.removeEventListener('keydown', handleKeydown);
         overlay.remove();
-        currentModal = null;
-    });
+        if (currentModal === overlay) currentModal = null;
+        if (closeCurrentModal === closeModal) closeCurrentModal = null;
+        if (modalSync?.overlay === overlay) modalSync = null;
+    };
+
+    // Create header
+    const header = createHeader(closeModal, highlightBlockedTweets, onBlockingModeChange);
 
     // Create tab bar
     const { tabBar, switchTab, updateTabCounts } = createTabBar();
@@ -90,10 +107,10 @@ export function showModal(config = {}) {
     updateTabCounts(blockedCountries.size, blockedRegions.size, tagTotal(), localBlockedLanguages.size, localBlockedAffiliations.size);
 
     // Create bodies for all tabs
-    const { body: countryBody, renderCountries, searchInput: countrySearch } = createCountryBody(blockedCountries, onCountryAction);
-    const { body: regionBody, renderRegions, searchInput: regionSearch } = createRegionBody(blockedRegions, onRegionAction);
-    const { body: tagBody, renderTags, searchInput: tagSearch } = createTagBody(onTagAction, onBioTagAction, onPcfAction);
-    const { body: languageBody, renderLanguages, searchInput: languageSearch } = createLanguageBody(localBlockedLanguages, onLanguageAction);
+    const { body: countryBody, renderCountries, syncCountries, searchInput: countrySearch } = createCountryBody(blockedCountries, onCountryAction);
+    const { body: regionBody, renderRegions, syncRegions, searchInput: regionSearch } = createRegionBody(blockedRegions, onRegionAction);
+    const { body: tagBody, renderTags, searchInput: tagSearch } = createTagBody(onTagAction, onBioTagAction, onLinkAction, onPcfAction);
+    const { body: languageBody, renderLanguages, syncLanguages, searchInput: languageSearch } = createLanguageBody(localBlockedLanguages, onLanguageAction);
     const { body: affiliationBody, renderAffiliations, searchInput: affiliationInput } = createAffiliationBody(localBlockedAffiliations, onAffiliationAction);
 
     // Tab content container
@@ -111,6 +128,15 @@ export function showModal(config = {}) {
     languageBody.style.display = 'none';
     affiliationBody.style.display = 'none';
 
+    // Footer stat for whichever tab is showing, and the counts on every tab header.
+    const refreshStats = () => {
+        if (activeTab === 'countries') updateStats(localBlockedCountries.size, 'countries');
+        else if (activeTab === 'regions') updateStats(localBlockedRegions.size, 'regions');
+        else if (activeTab === 'tags') updateStats(tagTotal(), 'tags');
+        else if (activeTab === 'languages') updateStats(localBlockedLanguages.size, 'languages');
+        else if (activeTab === 'affiliations') updateStats(localBlockedAffiliations.size, 'affiliations');
+    };
+
     // Tab switching logic
     const handleTabSwitch = tab => {
         activeTab = tab;
@@ -122,20 +148,17 @@ export function showModal(config = {}) {
         languageBody.style.display = tab === 'languages' ? 'block' : 'none';
         affiliationBody.style.display = tab === 'affiliations' ? 'block' : 'none';
 
+        refreshStats();
+
         if (tab === 'countries') {
-            updateStats(blockedCountries.size, 'countries');
             setTimeout(() => countrySearch.focus(), 50);
         } else if (tab === 'regions') {
-            updateStats(blockedRegions.size, 'regions');
             setTimeout(() => regionSearch.focus(), 50);
         } else if (tab === 'tags') {
-            updateStats(tagTotal(), 'tags');
             setTimeout(() => tagSearch.focus(), 50);
         } else if (tab === 'languages') {
-            updateStats(localBlockedLanguages.size, 'languages');
             setTimeout(() => languageSearch.focus(), 50);
         } else if (tab === 'affiliations') {
-            updateStats(localBlockedAffiliations.size, 'affiliations');
             setTimeout(() => affiliationInput.focus(), 50);
         }
     };
@@ -148,16 +171,18 @@ export function showModal(config = {}) {
     tabBar.querySelector('[data-tab="affiliations"]').addEventListener('click', () => handleTabSwitch('affiliations'));
 
     // Create footer
-    // Clearing the Tags tab clears all three of its lists — leaving two behind while the
+    // Clearing the Tags tab clears all four of its lists — leaving one behind while the
     // button says "Clear All" is exactly the kind of half-action that reads as a bug.
     const onClearTags = async () => {
         await Promise.all([
             onTagAction ? onTagAction('clear') : null,
             onBioTagAction ? onBioTagAction('clear') : null,
+            onLinkAction ? onLinkAction('clear') : null,
             onPcfAction ? onPcfAction('clear') : null
         ]);
         localBlockedTags.clear();
         localBlockedBioTags.clear();
+        localBlockedLinks.clear();
         localBlockedPcf.clear();
     };
 
@@ -173,10 +198,7 @@ export function showModal(config = {}) {
         renderRegions,
         renderTags,
         renderLanguages,
-        onClose: () => {
-            overlay.remove();
-            currentModal = null;
-        }
+        onClose: closeModal
     });
 
     // Assemble modal
@@ -189,29 +211,66 @@ export function showModal(config = {}) {
     // Close on overlay click
     overlay.addEventListener('click', e => {
         if (e.target === overlay) {
-            overlay.remove();
-            currentModal = null;
+            closeModal();
         }
     });
 
     // Close on Escape key
-    const handleKeydown = e => {
-        if (e.key === 'Escape') {
-            closeModal();
-        }
-    };
-    
-    const closeModal = () => {
-        document.removeEventListener('keydown', handleKeydown);
-        overlay.remove();
-        currentModal = null;
-    };
-    
     document.addEventListener('keydown', handleKeydown);
 
     // Add to page
     document.body.appendChild(overlay);
     currentModal = overlay;
+    closeCurrentModal = closeModal;
+
+    // Live sync: the content script calls syncModalState() whenever the background reports
+    // that a list changed — whether that was this modal, the options page, an import, or
+    // another tab. Each list is swapped into the SAME Set the render closures read from, so
+    // nothing needs re-wiring, then only the affected panel is repainted.
+    const setFor = kind => ({
+        countries: localBlockedCountries,
+        regions: localBlockedRegions,
+        tags: localBlockedTags,
+        bioTags: localBlockedBioTags,
+        links: localBlockedLinks,
+        pcf: localBlockedPcf,
+        languages: localBlockedLanguages,
+        affiliations: localBlockedAffiliations
+    })[kind];
+
+    // Tab-header badges. Also re-run from updateStats(), which every user action in this
+    // modal already calls after it changes a list, so the badges follow local edits and
+    // changes synced in from elsewhere alike.
+    const refreshCounts = () => updateTabCounts(
+        localBlockedCountries.size,
+        localBlockedRegions.size,
+        tagTotal(),
+        localBlockedLanguages.size,
+        localBlockedAffiliations.size
+    );
+
+    modalSync = {
+        overlay,
+        refreshCounts,
+        update(kind, values) {
+            const set = setFor(kind);
+            if (!set || !Array.isArray(values)) return;
+
+            set.clear();
+            for (const value of values) set.add(value);
+
+            // Pickers are updated in place so a list the user is scrolling doesn't jump;
+            // the small chip lists are cheap enough to rebuild.
+            if (kind === 'countries') syncCountries();
+            else if (kind === 'regions') syncRegions();
+            else if (kind === 'languages') syncLanguages();
+            else if (kind === 'affiliations') renderAffiliations();
+            else renderTags();
+
+            refreshCounts();
+            refreshStats();
+        }
+    };
 
     // Focus search input
     setTimeout(() => countrySearch.focus(), 100);
@@ -225,9 +284,18 @@ export function showModal(config = {}) {
 }
 
 /**
+ * Push a fresh list into the open modal (no-op when it is closed).
+ * @param {'countries'|'regions'|'tags'|'bioTags'|'links'|'pcf'|'languages'|'affiliations'} kind
+ * @param {string[]} values - the complete, current list
+ */
+export function syncModalState(kind, values) {
+    modalSync?.update(kind, values);
+}
+
+/**
  * Create modal header using safe DOM methods
  */
-function createHeader(onClose) {
+function createHeader(onClose, highlightBlockedTweets, onBlockingModeChange) {
     const header = createElement('div', { className: 'x-blocker-header' });
 
     // Create title with shield icon
@@ -240,6 +308,8 @@ function createHeader(onClose) {
     title.appendChild(titleSvg);
     title.appendChild(document.createTextNode('Blocking'));
 
+    const modeControl = createBlockingModeControl(highlightBlockedTweets, onBlockingModeChange);
+
     // Create close button
     const closeBtn = createElement('button', {
         className: 'x-blocker-close',
@@ -251,6 +321,7 @@ function createHeader(onClose) {
     closeBtn.addEventListener('click', onClose);
 
     header.appendChild(title);
+    header.appendChild(modeControl);
     header.appendChild(closeBtn);
 
     return header;
@@ -428,7 +499,9 @@ function createCountryBody(blockedCountries, onAction) {
         debouncedRender(e.target.value);
     });
 
-    return { body, renderCountries, searchInput: search };
+    const syncCountries = () => syncPickerItems(countriesContainer, key => blockedCountries.has(key));
+
+    return { body, renderCountries, syncCountries, searchInput: search };
 }
 
 /**
@@ -497,7 +570,9 @@ function createRegionBody(blockedRegions, onAction) {
         debouncedRender(e.target.value);
     });
 
-    return { body, renderRegions, searchInput: search };
+    const syncRegions = () => syncPickerItems(regionsContainer, key => blockedRegions.has(key));
+
+    return { body, renderRegions, syncRegions, searchInput: search };
 }
 
 /**
@@ -566,7 +641,9 @@ function createLanguageBody(blockedLanguages, onAction) {
         debouncedRender(e.target.value);
     });
 
-    return { body, renderLanguages, searchInput: search };
+    const syncLanguages = () => syncPickerItems(languagesContainer, key => blockedLanguages.has(key));
+
+    return { body, renderLanguages, syncLanguages, searchInput: search };
 }
 
 /**
@@ -690,16 +767,20 @@ function createAffiliationBody(blockedAffiliations, onAction) {
 
 /** Total across every "who they are" tag list, for the tab badge and footer. */
 function tagTotal() {
-    return (localBlockedTags?.size || 0) + (localBlockedBioTags?.size || 0) + (localBlockedPcf?.size || 0);
+    return (localBlockedTags?.size || 0) + (localBlockedBioTags?.size || 0) + (localBlockedLinks?.size || 0) + (localBlockedPcf?.size || 0);
 }
 
 /**
  * One free-text tag section (display name, or bio). Each gets its own input, list and
  * over-matching caution: the two match against completely different text, and presenting
  * them as a single undifferentiated list is what made over-matching read as a bug.
- * @param {{title: string, hint: string, placeholder: string, getSet: Function, onAction: Function}} opts
+ * `normalizeInput` returns '' to reject what was typed; when `invalidMessage` is supplied the
+ * rejection is explained in the same note slot the over-matching caution uses, so a bad entry
+ * never just silently does nothing.
+ * @param {{title: string, hint: string, placeholder: string, getSet: Function, onAction: Function,
+ *   normalizeInput?: Function, riskMessage?: Function, invalidMessage?: ((raw: string) => string)|null}} opts
  */
-function createTagSection({ title, hint, placeholder, getSet, onAction }) {
+function createTagSection({ title, hint, placeholder, getSet, onAction, normalizeInput = value => value.trim(), riskMessage = describeTagRisk, invalidMessage = null }) {
     const section = createElement('div', { className: 'x-blocker-tag-section' });
 
     const heading = createElement('div', { className: 'x-blocker-tag-group' });
@@ -726,11 +807,11 @@ function createTagSection({ title, hint, placeholder, getSet, onAction }) {
     section.appendChild(riskNote);
     section.appendChild(list);
 
-    const showRisk = tag => {
-        const message = tag ? describeTagRisk(tag) : null;
+    const showNote = message => {
         riskNote.textContent = message || '';
         riskNote.style.display = message ? 'block' : 'none';
     };
+    const showRisk = tag => showNote(tag ? riskMessage(tag) : null);
 
     const render = () => {
         list.replaceChildren();
@@ -772,8 +853,15 @@ function createTagSection({ title, hint, placeholder, getSet, onAction }) {
     };
 
     const add = async () => {
-        const value = input.value.trim();
-        if (!value || !onAction) return;
+        const raw = input.value.trim();
+        const value = normalizeInput(raw);
+        if (!value) {
+            // Empty box: nothing to say. Something typed but rejected: say why, and leave
+            // the text in place so it can be corrected rather than retyped.
+            if (raw && invalidMessage) showNote(invalidMessage(raw));
+            return;
+        }
+        if (!onAction) return;
         const response = await onAction('add', value);
         if (response?.success) {
             input.value = '';
@@ -795,18 +883,19 @@ function createTagSection({ title, hint, placeholder, getSet, onAction }) {
 }
 
 /**
- * Tags panel: three things an account can be filtered by, each matched against a different
+ * Tags panel: four things an account can be filtered by, each matched against a different
  * part of the account and therefore given its own section.
  *   - Display name  - substring of the name shown next to the handle
  *   - Bio           - substring of the profile description
+ *   - Links        - profile website and bio links, including subdomains
  *   - Account label - X's Parody / Commentary / Fan value or rendered grey badge
  */
-function createTagBody(onTagAction, onBioTagAction, onPcfAction) {
+function createTagBody(onTagAction, onBioTagAction, onLinkAction, onPcfAction) {
     const body = createElement('div', { className: 'x-blocker-body x-blocker-tab-panel', 'data-panel': 'tags' });
 
     body.appendChild(createElement('div', {
         className: 'x-blocker-info',
-        textContent: 'Filter accounts by what they say about themselves — the name they display, the text of their bio, or the account label X gives them.'
+        textContent: 'Filter accounts by what they say about themselves — the name they display, the text of their bio, the sites they link to, or the account label X gives them.'
     }));
 
     const nameSection = createTagSection({
@@ -819,10 +908,21 @@ function createTagBody(onTagAction, onBioTagAction, onPcfAction) {
 
     const bioSection = createTagSection({
         title: 'Bio contains',
-        hint: ' Matched anywhere inside the account’s bio',
+        hint: 'Matched anywhere inside the account’s bio',
         placeholder: 'Enter a word or phrase from a bio...',
         getSet: () => localBlockedBioTags,
         onAction: onBioTagAction
+    });
+
+    const linkSection = createTagSection({
+        title: 'Links to',
+        hint: 'Matched against the profile website, location, and bio links, including subdomains',
+        placeholder: 'Enter a domain...',
+        getSet: () => localBlockedLinks,
+        onAction: onLinkAction,
+        normalizeInput: value => normalizeHost(value),
+        riskMessage: () => null,
+        invalidMessage: raw => `"${raw}" isn't a valid domain. Try something like example.com.`
     });
 
     // Account label is a CLOSED set, so it gets pills rather than free text.
@@ -880,15 +980,36 @@ function createTagBody(onTagAction, onBioTagAction, onPcfAction) {
 
     body.appendChild(nameSection.section);
     body.appendChild(bioSection.section);
+    body.appendChild(linkSection.section);
     body.appendChild(labelSection);
 
     const renderAll = () => {
         nameSection.render();
         bioSection.render();
+        linkSection.render();
         renderLabels();
     };
 
     return { body, renderTags: renderAll, searchInput: nameSection.input };
+}
+
+/**
+ * Re-mark the rows of a picker list (countries / regions / languages) against the current
+ * blocked state without rebuilding them, so scroll position and search filter are kept.
+ * Rows are keyed by `data-key`, set where each row is created.
+ * @param {HTMLElement} container
+ * @param {(key: string) => boolean} isBlocked
+ */
+function syncPickerItems(container, isBlocked) {
+    for (const item of container.children) {
+        const key = item.dataset?.key;
+        if (key === undefined) continue;
+
+        const blocked = isBlocked(key);
+        item.classList.toggle('blocked', blocked);
+        const status = item.querySelector('.x-country-status');
+        if (status) status.textContent = blocked ? 'BLOCKED' : '';
+    }
 }
 
 /**
@@ -900,6 +1021,7 @@ function createCountryItem(country, blockedCountries, onAction) {
     const item = createElement('div', {
         className: `x-country-item${isBlocked ? ' blocked' : ''}`
     });
+    item.dataset.key = country;
 
     // Flag - using safe DOM methods (Twemoji <img> via the shared icon set)
     const flagSpan = createElement('span', { className: 'x-country-flag' });
@@ -962,6 +1084,7 @@ function createRegionItem(region, blockedRegions, onAction) {
     const item = createElement('div', {
         className: `x-country-item x-region-item${isBlocked ? ' blocked' : ''}`
     });
+    item.dataset.key = regionKey;
 
     // Globe emoji based on region
     const flagSpan = createElement('span', { className: 'x-country-flag x-region-flag' });
@@ -1017,6 +1140,7 @@ function createLanguageItem(language, blockedLanguages, onAction) {
     const item = createElement('div', {
         className: `x-country-item x-language-item${isBlocked ? ' blocked' : ''}`
     });
+    item.dataset.key = code;
 
     // Leading chip shows the exact BCP-47 code we match against (renders on every
     // OS, unlike country-flag emoji, and sidesteps one-flag-per-language ambiguity).
@@ -1141,9 +1265,53 @@ function createFooter({
 }
 
 /**
+ * Create the hide/highlight control used by the sidebar modal.
+ */
+function createBlockingModeControl(highlightBlockedTweets, onBlockingModeChange) {
+    const control = createElement('button', {
+        type: 'button',
+        className: 'x-blocker-mode-control'
+    });
+    const options = createElement('span', { className: 'x-blocker-mode-options' });
+    const highlightLabel = createElement('span', {
+        className: 'x-blocker-mode-option x-blocker-mode-highlight',
+        textContent: 'Highlight'
+    });
+    const divider = createElement('span', { className: 'x-blocker-mode-divider' });
+    const hideLabel = createElement('span', {
+        className: 'x-blocker-mode-option x-blocker-mode-hide',
+        textContent: 'Hide'
+    });
+    options.appendChild(highlightLabel);
+    options.appendChild(divider);
+    options.appendChild(hideLabel);
+    control.appendChild(options);
+    control.setAttribute('aria-label', 'Blocked tweets mode');
+    control.setAttribute('aria-pressed', highlightBlockedTweets === true ? 'true' : 'false');
+    control.classList.toggle('highlight', highlightBlockedTweets === true);
+
+    control.addEventListener('click', async () => {
+        if (!onBlockingModeChange) return;
+        const nextHighlight = !control.classList.contains('highlight');
+        control.disabled = true;
+        const response = await onBlockingModeChange(nextHighlight);
+        control.disabled = false;
+        if (response?.success) {
+            control.classList.toggle('highlight', nextHighlight);
+            control.setAttribute('aria-pressed', nextHighlight ? 'true' : 'false');
+        }
+    });
+
+    return control;
+}
+
+/**
  * Update stats display
  */
 function updateStats(count, type = 'countries') {
+    // Keep the tab-header badges in step with whatever just changed.
+    modalSync?.refreshCounts();
+
     const stats = document.getElementById('x-blocker-stats');
     if (stats) {
         let label;
