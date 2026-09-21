@@ -44,10 +44,10 @@ import { PacedLookupQueue, readRateLimitReset } from '../shared/request-policy.j
     const MAX_BIO_LENGTH = 200;
     // Mirrors PROFILE_CACHE_CONFIG.MAX_LOCATION_LENGTH.
     const MAX_LOCATION_LENGTH = 64;
-    // Bounded so the dedup set can't grow across a long session; cleared wholesale when it
-    // fills, which also lets a changed bio or follower count refresh eventually.
     // Mirrors PROFILE_CACHE_CONFIG.MAX_LINKS.
     const MAX_LINKS = 12;
+    // Bounded so the dedup set can't grow across a long session; cleared wholesale when it
+    // fills, which also lets a changed bio or follower count refresh eventually.
     const RECENT_EMIT_LIMIT = 500;
 
     // Starts ON, matching the default setting, and is only ever turned OFF by an explicit

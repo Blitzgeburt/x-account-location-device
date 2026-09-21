@@ -541,10 +541,11 @@ export const PROFILE_CACHE_CONFIG = {
     MAX_BIO_LENGTH: 200,
     // The profile location is free text too (X caps it at 30 characters); this is only a ceiling for a malformed relay message.
     MAX_LOCATION_LENGTH: 64,
+    // Capped so a bio stuffed with links can't inflate one record; a real profile has one or two.
+    MAX_LINKS: 12,
     // Hard ceiling on nodes visited while walking one response, so a pathological payload
     // can't pin the main thread. X sends ~20 tweets per page; this is orders of magnitude
-    // above what that needs. Capped so a bio stuffed with links can't inflate one record; a real profile has one or two.
-    MAX_LINKS: 12,
+    // above what that needs. 
     MAX_WALK_NODES: 200000
 };
 

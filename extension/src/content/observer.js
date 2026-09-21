@@ -3,7 +3,7 @@
  * Handles DOM observation, user processing, and caching
  */
 
-import { SELECTORS, CSS_CLASSES, MESSAGE_TYPES, TIMING, canonicalCountry, GOVERNMENT_LABEL } from '../shared/constants.js';
+import { SELECTORS, CSS_CLASSES, MESSAGE_TYPES, TIMING, canonicalCountry, findBlockedLink, GOVERNMENT_LABEL } from '../shared/constants.js';
 import { extractUsername, findInsertionPoint, getLoggedInUsername, extractTagsFromText, getDeviceCountry } from '../shared/utils.js';
 import { createBadge, findUserCellInsertionPoint, showRateLimitToast } from './ui.js';
 import { LRUCache } from '../shared/lru-cache.js';
@@ -762,9 +762,7 @@ function hasBlockedBio(screenName, blockedBioTags, settings) {
  * timeline responses (see profile-cache.js), so this costs no lookup. Absent profile
  * data simply means "not blocked" — never a guess.
  *
- * Matching is exact-host-or-subdomain, never substring: a substring test would let
- * 'example.com' match 'not-example.com' (false positive) and 'example.com.evil.net' (a
- * one-line evasion for anyone who noticed).
+ * Matching is exact-host-or-subdomain, never substring — see hostMatchesDomain() in constant.js
  * @param {string|null|undefined} screenName
  * @param {Set<string>|null} blockedLinks - normalized lowercase bare hosts
  * @param {{linksMatchLocation?: boolean}} [settings] - hosts written in the profile location
@@ -780,14 +778,7 @@ function hasBlockedLink(screenName, blockedLinks, settings) {
     const links = settings?.linksMatchLocation !== false && profile.locationLinks?.length
         ? [...(profile.links || []), ...profile.locationLinks]
         : profile.links;
-    if (!links || links.length === 0) return false;
-
-    for (const host of links) {
-        for (const domain of blockedLinks) {
-            if (host === domain || host.endsWith(`.${domain}`)) return true;
-        }
-    }
-    return false;
+    return findBlockedLink(links, blockedLinks) !== null;
 }
 
 /**
