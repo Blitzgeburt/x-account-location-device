@@ -217,6 +217,10 @@ export const DEFAULT_SETTINGS = {
     // (STORAGE_KEYS.CLOUD_CACHE_ENABLED) because the background reads it before settings
     // load. A `cloudCacheEnabled: false` used to sit here, read by nothing, riding along
     // in every settings export saying "false" even for users who had the cache on.
+    // Whether the free-text PROFILE LOCATION is checked as well as the bio ("Bio contains") and
+    // as well as the website and bio links ("Links to"). On by default; read as `!== false`.
+    bioTagsMatchLocation: true,
+    linksMatchLocation: true,
     highlightBlockedTweets: false  // If true, highlight instead of hide blocked tweets
 };
 
@@ -535,6 +539,8 @@ export function normalizePcfLabel(raw) {
 export const PROFILE_CACHE_CONFIG = {
     MAX_ENTRIES: 500,
     MAX_BIO_LENGTH: 200,
+    // The profile location is free text too (X caps it at 30 characters); this is only a ceiling for a malformed relay message.
+    MAX_LOCATION_LENGTH: 64,
     // Hard ceiling on nodes visited while walking one response, so a pathological payload
     // can't pin the main thread. X sends ~20 tweets per page; this is orders of magnitude
     // above what that needs. Capped so a bio stuffed with links can't inflate one record; a real profile has one or two.

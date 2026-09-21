@@ -908,7 +908,7 @@ function createTagBody(onTagAction, onBioTagAction, onLinkAction, onPcfAction) {
 
     const bioSection = createTagSection({
         title: 'Bio contains',
-        hint: 'Matched anywhere inside the account’s bio',
+        hint: 'Matched anywhere inside the account’s bio, and its profile location unless turned off in settings',
         placeholder: 'Enter a word or phrase from a bio...',
         getSet: () => localBlockedBioTags,
         onAction: onBioTagAction
@@ -916,7 +916,7 @@ function createTagBody(onTagAction, onBioTagAction, onLinkAction, onPcfAction) {
 
     const linkSection = createTagSection({
         title: 'Links to',
-        hint: 'Matched against the profile website, location, and bio links, including subdomains',
+        hint: 'Matched against the profile website, links in bio, and its profile location unless turned off in settings',
         placeholder: 'Enter a domain...',
         getSet: () => localBlockedLinks,
         onAction: onLinkAction,

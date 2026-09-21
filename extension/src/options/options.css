@@ -1762,3 +1762,48 @@ body {
 #panel-tags .country-selector {
     margin-bottom: 12px;
 }
+
+/* Compact toggle row that sits directly under a tag list in the Tags panel. Sized to the
+   group headings above it (13px label, 12px hint) rather than the 15px Settings rows, so a
+   sub-option reads as subordinate to the filter it belongs to. */
+#panel-tags .tag-option-row {
+    padding: 6px 0 12px;
+    border-bottom: none;
+    gap: 12px;
+}
+
+/* Label and description share a line, the way a group heading and its hint do; the
+   description wraps underneath only when the panel is too narrow for both. */
+#panel-tags .tag-option-row .option-info {
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 2px 8px;
+    min-width: 0;
+}
+
+#panel-tags .tag-option-row .option-label {
+    font-size: 13px;
+    font-weight: 500;
+}
+
+#panel-tags .tag-option-row .option-description {
+    font-size: 12px;
+    line-height: 1.4;
+}
+
+#panel-tags .tag-option-row .toggle {
+    width: 38px;
+    height: 22px;
+}
+
+#panel-tags .tag-option-row .toggle-slider:before {
+    height: 14px;
+    width: 14px;
+    left: 3px;
+    bottom: 3px;
+}
+
+#panel-tags .tag-option-row .toggle input:checked + .toggle-slider:before {
+    transform: translateX(16px);
+}

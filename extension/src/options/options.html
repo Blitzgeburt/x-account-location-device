@@ -458,6 +458,16 @@
                         <span class="tag-group-heading-label">Bio contains</span>
                         <span class="tag-group-heading-hint">Matched anywhere inside the account's bio</span>
                     </div>
+                    <div class="option-row tag-option-row">
+                        <div class="option-info">
+                            <span class="option-label">Check location</span>
+                            <span class="option-description">Also match against the location text</span>
+                        </div>
+                        <label class="toggle">
+                            <input type="checkbox" id="opt-bio-tags-match-location" checked>
+                            <span class="toggle-slider"></span>
+                        </label>
+                    </div>
                     <div class="country-selector">
                         <div class="tag-input-row">
                             <input type="text" class="country-search" id="bio-tag-input" placeholder="Enter a word or phrase from a bio...">
@@ -472,7 +482,17 @@
                     <!-- Linked domains -->
                     <div class="tag-group-heading">
                         <span class="tag-group-heading-label">Links to</span>
-                        <span class="tag-group-heading-hint">Matched against the profile's website, location, and any link in its bio, including subdomains</span>
+                        <span class="tag-group-heading-hint">Matched against the profile's website and any link in its bio, including subdomains</span>
+                    </div>
+                    <div class="option-row tag-option-row">
+                        <div class="option-info">
+                            <span class="option-label">Check location</span>
+                            <span class="option-description">Also match against links in the location text</span>
+                        </div>
+                        <label class="toggle">
+                            <input type="checkbox" id="opt-links-match-location" checked>
+                            <span class="toggle-slider"></span>
+                        </label>
                     </div>
                     <div class="country-selector">
                         <div class="tag-input-row">

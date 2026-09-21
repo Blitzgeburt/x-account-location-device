@@ -42,6 +42,8 @@ import { PacedLookupQueue, readRateLimitReset } from '../shared/request-policy.j
     // Mirrors PROFILE_CACHE_CONFIG.MAX_WALK_NODES.
     const MAX_WALK_NODES = 200000;
     const MAX_BIO_LENGTH = 200;
+    // Mirrors PROFILE_CACHE_CONFIG.MAX_LOCATION_LENGTH.
+    const MAX_LOCATION_LENGTH = 64;
     // Bounded so the dedup set can't grow across a long session; cleared wholesale when it
     // fills, which also lets a changed bio or follower count refresh eventually.
     // Mirrors PROFILE_CACHE_CONFIG.MAX_LINKS.
@@ -282,6 +284,24 @@ import { PacedLookupQueue, readRateLimitReset } from '../shared/request-policy.j
     }
 
     /**
+     * The free-text location on a profile ("Berlin", "Earth 🌍"), or '' when absent.
+     *
+     * X has shipped this as a plain string and as an object, depending on the query, so
+     * both shapes are read. Shared by extractLinks (hosts written into the location) and
+     * projectUser (the text itself, for the bio-term filter).
+     */
+    function locationTextOf(user) {
+        const location = user?.location;
+        const text = typeof location === 'string'
+            ? location
+            : location && typeof location === 'object'
+                ? [location.location, location.name, location.text, location.value]
+                    .find(value => typeof value === 'string')
+                : '';
+        return typeof text === 'string' ? text.trim() : '';
+    }
+
+    /**
      * Hosts an account links to, from the profile data X already sent with the timeline.
      *
      * Reads `entities`, never the bare `url` field: that is the t.co wrapper, identical in
@@ -291,8 +311,8 @@ import { PacedLookupQueue, readRateLimitReset } from '../shared/request-policy.j
     * Both the newer `profile_bio.entities` and the older `legacy.entities` shapes are
     * read, because X ships both depending on the query, and a filter that silently stops
     * matching after a response-shape change is worse than one that never worked. The
-    * profile location is also scanned as plain text: X exposes it separately from the
-    * bio and does not consistently provide link entities for it.
+    * profile location is scanned separately (extractLocationLinks): X exposes it apart from
+    * the bio and does not consistently provide link entities for it.
      */
     function extractLinks(user) {
         const hosts = [];
@@ -325,19 +345,25 @@ import { PacedLookupQueue, readRateLimitReset } from '../shared/request-policy.j
             }
         }
 
-        const location = user?.location;
-        const locationText = typeof location === 'string'
-            ? location
-            : location && typeof location === 'object'
-                ? [location.location, location.name, location.text, location.value]
-                    .find(value => typeof value === 'string')
-                : '';
-        if (locationText) {
-            for (const match of locationText.slice(0, MAX_BIO_LENGTH).matchAll(BARE_DOMAIN)) {
-                if (add(match[1])) return hosts;
-            }
-        }
+        return hosts;
+    }
 
+    /**
+     * Hosts written into the profile LOCATION text ("see example.com"), kept apart from
+     * extractLinks so the content script can honour the "Links to also checks location"
+     * setting without a round-trip to this page script.
+     */
+    function extractLocationLinks(user) {
+        const hosts = [];
+        const locationText = locationTextOf(user);
+        if (!locationText) return hosts;
+
+        for (const match of locationText.slice(0, MAX_BIO_LENGTH).matchAll(BARE_DOMAIN)) {
+            const host = hostOf(match[1]);
+            if (!host || host === 't.co' || hosts.includes(host)) continue;
+            hosts.push(host);
+            if (hosts.length >= MAX_LINKS) break;
+        }
         return hosts;
     }
 
@@ -349,10 +375,14 @@ import { PacedLookupQueue, readRateLimitReset } from '../shared/request-policy.j
         const tweets = user.tweet_counts || {};
         const bio = user.profile_bio?.description;
         const links = extractLinks(user);
+        const locationText = locationTextOf(user);
+        const locationLinks = extractLocationLinks(user);
         return {
             u: screenName,
             b: typeof bio === 'string' && bio ? bio.slice(0, MAX_BIO_LENGTH) : undefined,
+            o: locationText ? locationText.slice(0, MAX_LOCATION_LENGTH) : undefined,
             l: links.length > 0 ? links : undefined,
+            h: locationLinks.length > 0 ? locationLinks : undefined,
             p: typeof user.parody_commentary_fan_label === 'string'
                 ? user.parody_commentary_fan_label
                 : undefined,

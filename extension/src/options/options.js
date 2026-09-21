@@ -25,6 +25,8 @@ const elements = {
     optInfoIcon: document.getElementById('opt-info-icon'),
     optClickDetails: document.getElementById('opt-click-details'),
     optShowVpnUsers: document.getElementById('opt-show-vpn-users'),
+    optBioTagsMatchLocation: document.getElementById('opt-bio-tags-match-location'),
+    optLinksMatchLocation: document.getElementById('opt-links-match-location'),
     optSidebarLink: document.getElementById('opt-sidebar-link'),
     optChangelogOnUpdate: document.getElementById('opt-changelog-on-update'),
     // Blocking Mode
@@ -338,6 +340,12 @@ function applySettingsToInputs(s) {
     }
     if (elements.optShowVpnUsers) {
         elements.optShowVpnUsers.checked = s.showVpnUsers !== false;
+    }
+    if (elements.optBioTagsMatchLocation) {
+        elements.optBioTagsMatchLocation.checked = s.bioTagsMatchLocation !== false;
+    }
+    if (elements.optLinksMatchLocation) {
+        elements.optLinksMatchLocation.checked = s.linksMatchLocation !== false;
     }
 
     // Blocking mode toggles - mutually exclusive
@@ -2237,6 +2245,18 @@ function setupEventListeners() {
     if (elements.optProfileEnrichment) {
         elements.optProfileEnrichment.addEventListener('change', e => {
             saveSettings({ profileEnrichment: e.target.checked });
+        });
+    }
+
+    // Whether "Bio contains" / "Links to" also look at the profile location text
+    if (elements.optBioTagsMatchLocation) {
+        elements.optBioTagsMatchLocation.addEventListener('change', e => {
+            saveSettings({ bioTagsMatchLocation: e.target.checked });
+        });
+    }
+    if (elements.optLinksMatchLocation) {
+        elements.optLinksMatchLocation.addEventListener('change', e => {
+            saveSettings({ linksMatchLocation: e.target.checked });
         });
     }
 

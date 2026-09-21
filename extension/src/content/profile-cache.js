@@ -22,7 +22,7 @@
 import { LRUCache } from '../shared/lru-cache.js';
 import { PROFILE_CACHE_CONFIG, normalizePcfLabel, normalizeHost } from '../shared/constants.js';
 
-/** screenName (lowercase) -> { bio, pcf, followers, following, tweets, media } */
+/** screenName (lowercase) -> { bio, location, links, locationLinks, pcf, followers, following, tweets, media } */
 const profiles = new LRUCache(PROFILE_CACHE_CONFIG.MAX_ENTRIES);
 
 /**
@@ -39,13 +39,19 @@ function toCount(value) {
  * Store one harvested profile. Values are copied into a fresh object of primitives —
  * see the memory contract above.
  * @param {string} screenName
- * @param {{bio?: string, pcf?: string, followers?: number, following?: number, tweets?: number, media?: number}} data
+ * @param {{bio?: string, location?: string, links?: string[], locationLinks?: string[], pcf?: string, followers?: number, following?: number, tweets?: number, media?: number}} data
  */
 export function setProfile(screenName, data) {
     if (!screenName || typeof screenName !== 'string' || !data) return;
 
     const bio = typeof data.bio === 'string'
         ? data.bio.slice(0, PROFILE_CACHE_CONFIG.MAX_BIO_LENGTH)
+        : null;
+
+    // The profile location text ("Berlin", "Earth 🌍") — the free-text field on the profile,
+    // not the country resolved by the About-account lookup. Session-only, like the bio.
+    const location = typeof data.location === 'string'
+        ? data.location.trim().slice(0, PROFILE_CACHE_CONFIG.MAX_LOCATION_LENGTH)
         : null;
 
     // page-script.js already normalizes and caps these, but setProfile is the storage
@@ -59,9 +65,21 @@ export function setProfile(screenName, data) {
         )].slice(0, PROFILE_CACHE_CONFIG.MAX_LINKS)
         : [];
 
+    // Hosts written into the location text. Kept apart from `links` so the "Links to" filter
+    // can include or ignore the location without the harvest knowing about the setting.
+    const locationLinks = Array.isArray(data.locationLinks)
+        ? [...new Set(
+            data.locationLinks
+                .map(normalizeHost)
+                .filter(Boolean)
+        )].slice(0, PROFILE_CACHE_CONFIG.MAX_LINKS)
+        : [];
+
     profiles.set(screenName.toLowerCase(), {
         bio: bio || null,
+        location: location || null,
         links,
+        locationLinks,
         pcf: normalizePcfLabel(data.pcf) || null,
         followers: toCount(data.followers),
         following: toCount(data.following),
@@ -72,7 +90,7 @@ export function setProfile(screenName, data) {
 
 /**
  * @param {string|null|undefined} screenName
- * @returns {{bio: string|null, links: string[], pcf: string|null, followers: number|null, following: number|null, tweets: number|null, media: number|null}|null}
+ * @returns {{bio: string|null, location: string|null, links: string[], locationLinks: string[], pcf: string|null, followers: number|null, following: number|null, tweets: number|null, media: number|null}|null}
  */
 export function getProfile(screenName) {
     if (!screenName || typeof screenName !== 'string') return null;

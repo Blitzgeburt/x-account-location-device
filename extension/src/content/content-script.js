@@ -282,7 +282,9 @@ function setupProfileListener() {
         for (const entry of users) {
             setProfile(entry.u, {
                 bio: entry.b,
+                location: entry.o,
                 links: entry.l,
+                locationLinks: entry.h,
                 pcf: entry.p,
                 followers: entry.f,
                 following: entry.g,
@@ -421,6 +423,16 @@ async function handleBackgroundMessage(type, payload) {
             
             if (prevSettings.profileEnrichment !== settings.profileEnrichment) {
                 syncEnrichmentSetting();
+            }
+
+            // The location-matching toggles change what an existing bio term / linked domain
+            // catches, not what is displayed. Verdicts are re-derived from the current lists
+            // and settings, so a plain re-evaluation both applies and undoes them; no rescan.
+            if (isEnabled &&
+                (blockedBioTags.size > 0 || blockedLinks.size > 0) &&
+                (prevSettings.bioTagsMatchLocation !== settings.bioTagsMatchLocation ||
+                 prevSettings.linksMatchLocation !== settings.linksMatchLocation)) {
+                updateBlockedTweets(currentFilters());
             }
 
             if (prevSettings.showSidebarBlockerLink !== settings.showSidebarBlockerLink) {

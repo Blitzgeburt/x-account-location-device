@@ -184,8 +184,8 @@ function applyInfoToElement(element, screenName, info, opts) {
     const affiliationBlocked = hasBlockedAffiliation(info?.meta, blockedAffiliations);
     // Bio, links and account label come from the profile data X already sent with the timeline,
     // so neither costs a lookup — see profile-cache.js.
-    const bioBlocked = hasBlockedBio(screenName, blockedBioTags);
-    const linkBlocked = hasBlockedLink(screenName, blockedLinks);
+    const bioBlocked = hasBlockedBio(screenName, blockedBioTags, settings);
+    const linkBlocked = hasBlockedLink(screenName, blockedLinks, settings);
     const labelBlocked = hasBlockedAccountLabel(element, tweet, screenName, blockedPcf);
     const blockReason = resolveBlockReason({
         isExempt,
@@ -719,25 +719,38 @@ function getAccountTypeTokens(element, tweet) {
 }
 
 /**
- * Does this account's BIO contain a blocked term?
+ * Does this account's BIO or profile LOCATION contain a blocked term?
  *
- * The bio comes from the profile data X already ships with its own timeline responses
+ * Both come from the profile data X already ships with its own timeline responses
  * (see profile-cache.js), so this costs no lookup. Absent profile data simply means "not
  * blocked" — never a guess.
+ *
+ * The location is the free-text field on the profile ("Berlin", "Earth 🌍", a slogan), so a
+ * bio term is matched against it the same way it is against the bio — separately, never
+ * against the two joined, so a term can't match across the seam between them. This is
+ * unrelated to the country filter, which uses the resolved About-account country.
  * @param {string|null|undefined} screenName
  * @param {Set<string>|null} blockedBioTags - lowercase terms
+ * @param {{bioTagsMatchLocation?: boolean}} [settings] - location is checked unless this is false
  * @returns {boolean}
  */
-function hasBlockedBio(screenName, blockedBioTags) {
+function hasBlockedBio(screenName, blockedBioTags, settings) {
     if (!screenName || !blockedBioTags || blockedBioTags.size === 0) return false;
 
-    const bio = getProfile(screenName)?.bio;
-    if (!bio) return false;
+    const profile = getProfile(screenName);
+    if (!profile) return false;
 
-    const haystack = bio.toLowerCase();
+    // The location is opt-out: only an explicit `false` turns it off, so an older saved
+    // settings object without the key keeps matching it.
+    const includeLocation = settings?.bioTagsMatchLocation !== false;
+    const fields = [profile.bio, includeLocation ? profile.location : null]
+        .filter(Boolean)
+        .map(text => text.toLowerCase());
+    if (fields.length === 0) return false;
+
     for (const term of blockedBioTags) {
         const needle = term.trim().toLowerCase();
-        if (needle && haystack.includes(needle)) return true;
+        if (needle && fields.some(haystack => haystack.includes(needle))) return true;
     }
     return false;
 }
@@ -754,12 +767,19 @@ function hasBlockedBio(screenName, blockedBioTags) {
  * one-line evasion for anyone who noticed).
  * @param {string|null|undefined} screenName
  * @param {Set<string>|null} blockedLinks - normalized lowercase bare hosts
+ * @param {{linksMatchLocation?: boolean}} [settings] - hosts written in the profile location
+ *   are checked too unless this is false
  * @returns {boolean}
  */
-function hasBlockedLink(screenName, blockedLinks) {
+function hasBlockedLink(screenName, blockedLinks, settings) {
     if (!screenName || !blockedLinks || blockedLinks.size === 0) return false;
 
-    const links = getProfile(screenName)?.links;
+    const profile = getProfile(screenName);
+    if (!profile) return false;
+
+    const links = settings?.linksMatchLocation !== false && profile.locationLinks?.length
+        ? [...(profile.links || []), ...profile.locationLinks]
+        : profile.links;
     if (!links || links.length === 0) return false;
 
     for (const host of links) {
@@ -1552,8 +1572,8 @@ function runUpdateBlockedTweets({
         // removing a tag re-apply to already-rendered tweets — and, because we never
         // trust a cached flag, a recycled row can't inherit a previous occupant's block.
         const isTagBlocked = hasTags && hasBlockedTag(extractDisplayName(element), blockedTags);
-        const isBioBlocked = hasBlockedBio(screenName, blockedBioTags);
-        const isLinkBlocked = hasBlockedLink(screenName, blockedLinks);
+        const isBioBlocked = hasBlockedBio(screenName, blockedBioTags, settings);
+        const isLinkBlocked = hasBlockedLink(screenName, blockedLinks, settings);
         const isLabelBlocked = hasBlockedAccountLabel(element, tweet, screenName, blockedPcf);
 
         // Affiliation lives on the cached info, keyed by name, like locationAccurate below.
